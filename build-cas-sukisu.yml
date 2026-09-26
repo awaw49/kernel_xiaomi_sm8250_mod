@@ -112,21 +112,28 @@ jobs:
             exit 1
           fi
 
-          # 整词匹配:kernel_compat.c 里也有一堆 *_access_ok 之类的近似名字,
-          # 用子串匹配会得到假的正数。这里必须确认 kprobe 注册路径存在。
-          KPROBE=$(strings -a "$IMG" | grep -cxE "register_kprobe" || true)
-          echo "  register_kprobe(整词)命中: $KPROBE"
-          if [ "${KPROBE:-0}" -lt 1 ]; then
-            echo "  ❌ 没有 register_kprobe —— KSU_MANUAL_HOOK 是不是被误开了?"
-            echo "     开着它 KSU 走的是手动打补丁路径,和预期的 kprobe 路径不符。"
+          # 这棵树走 KSU_MANUAL_HOOK:内核源码里预埋了 ksu_vfs_read_hook /
+          # ksu_execveat_hook / ksu_input_hook 三个调用点,KSU 侧靠手动路径接上。
+          # 所以判据不是 register_kprobe(那是 kprobes 模式才有的),而是这三个
+          # 符号得真的在 Image 里 —— 少一个就说明手动路径没链接进去,
+          # 刷机后 execveat / input 事件会走进空指针。
+          # 整词匹配:用子串会被 ksu_vfs_read_hook 之类的近似名骗到。
+          MISSING=0
+          for sym in ksu_vfs_read_hook ksu_execveat_hook ksu_input_hook; do
+            N=$(strings -a "$IMG" | grep -cxE "$sym" || true)
+            echo "  $sym (整词)命中: $N"
+            [ "${N:-0}" -ge 1 ] || MISSING=$((MISSING+1))
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "  ❌ 缺 $MISSING 个手动挂钩符号 —— KSU_MANUAL_HOOK 路径没链接进去"
             exit 1
           fi
+          echo "  ✅ 三个手动挂钩符号齐全"
 
           if strings -a "$IMG" | grep -q "KPROBES is disabled"; then
-            echo "  ❌ 内核仍带 KPROBES 告警 —— KSU 会失效"
+            echo "  ❌ 内核仍带 KPROBES 告警"
             exit 1
           fi
-          echo "  ✅ 无 KPROBES 告警"
 
           strings -a "$IMG" | grep -m1 "Linux version" || true
           echo "✅ Image 校验通过"
