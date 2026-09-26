@@ -2,18 +2,16 @@ name: Build cas SukiSU kernel
 
 on:
   workflow_dispatch:
-  push:
-    branches: [cas-ksu-v4-kprobes]
-    paths:
-      - 'build_cas_sukisu.sh'
-      - 'arch/arm64/configs/cas_defconfig'
+  # push 触发已移除:本文件是 build-cas-sukisu-v2.yml 的前身,两者 push paths
+  # 都匹配 build_cas_sukisu.sh,导致每次改脚本都白跑一遍整树编译。
+  # 保留 workflow_dispatch 供对照排查,日常不走这里。
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 300
-    env:
-      SUKISU_TAG: v4.2.0
+    # 原 env: SUKISU_TAG: v4.2.0 —— 已删除。SukiSU-Ultra 根本没有 v4.2.0 这个
+    # tag,钉一个不存在的版本号,产物文件名会印着一个不存在的版本。
 
     steps:
       - name: Checkout
