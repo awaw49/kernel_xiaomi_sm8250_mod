@@ -43,11 +43,22 @@ TARGET_DEVICE=cas
 GIT_COMMIT_ID=$(git rev-parse --short=8 HEAD)
 
 # ---- SukiSU 固定版本 ----
+#
+# 版本锁在【脚本】里,yml 不设 SUKISU_REF 的 env。之前踩过:
+#   yml 的 env: SUKISU_REF: f4863b20  ← 优先级高于脚本的 ${SUKISU_REF:-...}
+# 于是脚本注释写着 329b7f59、脚本默认值也是 329b7f59,实际编出来的却是
+# f4863b20,而 zip 文件名里还印着 329b7f59 —— 三处自相矛盾,而且从产物
+# 上完全看不出来。"单一事实来源"这句话,只有在没有更高优先级的来源时
+# 才成立。yml 里已删掉这个 env。
 SUKISU_REPO="${SUKISU_REPO:-https://github.com/liyafe1997/SukiSU-Ultra}"
 SUKISU_REF="${SUKISU_REF:-329b7f59dc84d79ac27a3487cf21d90c01cdf656}"
-# 打在 zip 文件名里的标签。锁的是 commit 不是 tag,这里用日期+短 sha 标,
-# 免得文件名上写着 v4.2.0 结果内容完全是另一回事。
-KSU_LABEL="${KSU_LABEL:-329b7f59-4.19-nongki}"
+KSU_EXPECTED_REF="$SUKISU_REF"
+
+# 打在 zip 文件名里的标签 —— 从 REF 派生,不硬编码。
+# 之前这里写死 "329b7f59-4.19-nongki",而 REF 可能被 yml 的 env 改掉,
+# 结果文件名里的版本号和实际编的东西无关,这正是"声称 v4.2.0 内容却是另一
+# 回事"那类错误的来源。派生之后两者永远一致:想换版本只改上面一行。
+KSU_LABEL="${KSU_LABEL:-${SUKISU_REF:0:8}-4.19-nongki}"
 
 # ---- 工具链:CI 里用 clang + 交叉 binutils ----
 if [ -z "${CLANG_BIN:-}" ]; then
@@ -75,8 +86,24 @@ echo "[SukiSU] clone ${SUKISU_REPO} @ ${SUKISU_REF}"
 rm -rf KernelSU
 git clone --filter=blob:none "${SUKISU_REPO}" KernelSU
 git -C KernelSU checkout --detach "${SUKISU_REF}"
-echo "[SukiSU] HEAD = $(git -C KernelSU rev-parse HEAD)"
+
+# checkout 之后核对真实 SHA —— 这才是"编的到底是哪一版"的唯一可信凭据。
+# 之前只 echo 不校验,而 SUKISU_REF 会被 yml 的 env 悄悄改掉(f4863b20 那次),
+# 于是日志第 4 行印着一个版本、实际编的是另一个、产物文件名还印着第三个。
+# 凡是靠"我以为我设了"来保证的东西,都要在这里用实际值再对一遍。
+KSU_ACTUAL_REF=$(git -C KernelSU rev-parse HEAD)
+echo "[SukiSU] HEAD       = ${KSU_ACTUAL_REF}"
+echo "[SukiSU] 期望        = ${KSU_EXPECTED_REF}"
 echo "[SukiSU] 提交: $(git -C KernelSU log -1 --format='%ad %s' --date=short)"
+echo "[SukiSU] 文件名标签  = ${KSU_LABEL}"
+if [ "$KSU_ACTUAL_REF" != "$KSU_EXPECTED_REF" ]; then
+    echo "❌ 期望 ${KSU_EXPECTED_REF},实际 checkout 到 ${KSU_ACTUAL_REF} —— 版本对不上,终止"
+    exit 1
+fi
+if [ "${KSU_LABEL:0:8}" != "${KSU_ACTUAL_REF:0:8}" ]; then
+    echo "❌ 文件名标签 ${KSU_LABEL} 与实际 commit ${KSU_ACTUAL_REF:0:8} 不符 —— 产物会被错标,终止"
+    exit 1
+fi
 
 # 挂进 drivers/ —— 必须是相对 symlink,kbuild 才能找到源文件
 ln -sfn ../KernelSU/kernel drivers/kernelsu
@@ -389,3 +416,23 @@ cd ..
 
 echo "===== 完成 ====="
 ls -la dist/
+
+# ---- 构建凭据:由脚本产出,yml 只负责 cat ----
+# yml 以前自己 echo "${SUKISU_REPO} @ ${SUKISU_REF}" 写进 job summary,
+# 那个 $SUKISU_REF 是 yml 自己的 env,和脚本实际 checkout 的东西是两条独立
+# 通路 —— f4863b20 那次两者就不一致,而 summary 显示的是错的那个。
+# 改成让脚本把自己核对过的真实值落盘,yml 只读这个文件,summary 里出现的
+# 就只可能是实际编出来的那一版。
+cat > dist/BUILD_INFO.txt <<EOF
+SukiSU 仓库 : ${SUKISU_REPO}
+SukiSU 期望 : ${KSU_EXPECTED_REF}
+SukiSU 实际 : ${KSU_ACTUAL_REF}
+SukiSU 提交 : $(git -C KernelSU log -1 --format='%ad %s' --date=short)
+提交时间   : $(git -C KernelSU log -1 --format=%aI)
+文件名标签 : ${KSU_LABEL}
+内核版本   : $(strings -a dist/Image_cas_sukisu | grep -m1 -o 'Linux version [^ ]*' || echo '(未取到)')
+Image 大小 : $(stat -c%s dist/Image_cas_sukisu) 字节
+Image md5  : $(md5sum dist/Image_cas_sukisu | cut -d' ' -f1)
+EOF
+echo "----- 构建凭据 -----"
+cat dist/BUILD_INFO.txt
