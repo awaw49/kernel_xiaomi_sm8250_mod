@@ -87,12 +87,37 @@ if ! grep -q 'KSU_NO_WERROR_MARK' drivers/kernelsu/Makefile; then
     echo "[SukiSU] 已给 KSU 子目录加 -Wno-error"
 fi
 
+# ---- 预生成 security/selinux 的派生头文件 ----
+# out/security/selinux/flask.h 不是源码,是 scripts/selinux/genheaders/genheaders
+# 在编译 security/selinux/ 时生成的(见该目录 Makefile 第 31 行)。
+# KSU 的 selinux/sepolicy.c、selinux/rules.c 要 include 它,KSU Makefile 靠
+# -I$(objtree)/security/selinux 定位 —— 路径本身是对的,问题在顺序:
+# 顶层 Makefile 里 drivers/ 排在 security/ 之前,-j 并行时 drivers/kernelsu
+# 很可能先编完,而那时 flask.h 还不存在。预检只编 drivers/kernelsu/,更是必然落空。
+# 社区那个 modder 能编出包,靠的是并行时序碰巧对了,不可复现。
+#
+# 办法:先单独编一遍 security/selinux/ 把 flask.h 落盘。preflight 和后面的整树
+# 编译共用同一个 out/,所以这一步对两段都有效。整树编译若因 .config 变化重编
+# selinux,flask.h 会被重新生成 —— 但那时它至少已经存在过,ksu 那边不会失败。
+gen_flask_header() {
+    echo "[genhdr] 预生成 security/selinux/flask.h ..."
+    if ! make $MAKE_ARGS -k security/selinux/ >/tmp/genhdr.log 2>&1; then
+        echo "[genhdr] ❌ 编译 security/selinux 失败,尾部日志:"
+        tail -30 /tmp/genhdr.log
+        exit 1
+    fi
+    local f=out/security/selinux/flask.h
+    test -f "$f" || { echo "[genhdr] ❌ 编译成功但没有 $f,genheaders 规则变了?"; exit 1; }
+    echo "[genhdr] ✅ $f ($(wc -c < "$f" | tr -d ' ') 字节)"
+}
+
 # ---- 预检:只编 KSU 目录 ----
 # 整棵树要十几分钟才走到 drivers/kernelsu,4.19 兼容问题一个一个冒出来、一轮十几分钟。
 # 这里先把 KSU 单独编出来,配合 -k 一次把剩下所有不兼容点全收齐,再决定要不要跑整树。
 echo "[preflight] 单独编译 drivers/kernelsu(配 -k 一次收全所有错误)..."
 make $MAKE_ARGS ${TARGET_DEVICE}_defconfig >/dev/null
 scripts/config --file out/.config -e KSU -e KPM
+gen_flask_header
 rm -rf out/drivers/kernelsu 2>/dev/null || true
 rm -f /tmp/preflight.log
 
@@ -259,6 +284,11 @@ echo "===== 生效的关键选项 ====="
 grep -E '^CONFIG_(KSU|KPM|KSU_MANUAL_HOOK|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL)=' out/.config || true
 grep -E '^# CONFIG_(KSU_MANUAL_HOOK|KSU_DEBUG|KPROBES) is not set' out/.config || true
 echo "============================="
+
+# 整树编译前再确认一次 flask.h 在位。中间隔了一次 defconfig,若 .config 有任何
+# 变化导致 security/selinux 被重编,它的 flask.h 会跟着重新生成 —— 顺序上
+# drivers/ 仍然在 security/ 之前,所以这里显式再落一次盘,不去赌并行时序。
+gen_flask_header
 
 # -k:一次把剩下所有错误收齐,而不是撞上第一个就停。
 # 每轮整树编译十几分钟,一轮只换一个错误太亏。
