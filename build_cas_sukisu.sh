@@ -3,6 +3,14 @@
 # 由 awaw49 在 fork 上新增,用于 GitHub Actions 出包
 set -euo pipefail
 
+# 本脚本有 ~60 处 GNU 风格 `sed -i 's/../g' file`。macOS 的 BSD sed 语法不同,
+# 这些命令会静默失败(不报错、也不改文件),结果是 dts 补丁全丢但构建照样跑完,
+# 出一个"看着成功"实则没打 MIUI 补丁的包。与其让它悄悄错,不如直接拦下。
+if ! sed --version >/dev/null 2>&1; then
+    echo "错误:需要 GNU sed。本脚本在 macOS/BSD sed 上会静默失效(请用 CI 或 Linux)。" >&2
+    exit 1
+fi
+
 TARGET_DEVICE=cas
 GIT_COMMIT_ID=$(git rev-parse --short=8 HEAD)
 SUKISU_TAG="${SUKISU_TAG:-v4.2.0}"
@@ -26,6 +34,64 @@ echo "[SukiSU] 安装 ${SUKISU_TAG} ..."
 curl -LSs "https://github.com/SukiSU-Ultra/SukiSU-Ultra/raw/${SUKISU_TAG}/kernel/setup.sh" | sh -s "${SUKISU_TAG}"
 test -d KernelSU/kernel || { echo "SukiSU 安装失败"; exit 1; }
 echo "[SukiSU] 实际版本: $(cd KernelSU && git describe --tags 2>/dev/null || echo unknown)"
+
+# ---- 4.19 兼容:KPM 用了两参数 access_ok,而 4.19 的 arm64 还是三参数 ----
+# 上游 v4.2.0 的 kpm.c 里 10 处 access_ok() 全是裸调、零版本保护,在这棵 4.19
+# 树上会直接报 "too few arguments provided to function-like macro invocation"。
+# 按仓库自己 kernel/infra/file_wrapper.c 的 #if/#elif/#else 范式补一个包装宏,
+# 只在 <5.9 时走三参数分支;不改上游任何逻辑,只换调用点。
+KPM_C=KernelSU/kernel/kpm/kpm.c
+python3 - "$KPM_C" <<'PY'
+import sys
+
+p = sys.argv[1]
+src = open(p).read()
+
+# 幂等守卫必须看 shim 的【定义行】,不能看 ksu_access_ok 这个名字 ——
+# 调用点改写之后这个名字必然出现在文件里,拿它当判据会自己把自己拦下来。
+if "#define ksu_access_ok" in src:
+    print("[compat] 兼容层已存在,跳过")
+    sys.exit(0)
+
+n = src.count("if (!access_ok(")
+if n == 0:
+    print("[compat] 上游已无裸调 access_ok,跳过")
+    sys.exit(0)
+
+# 锚点取自 kpm.c:41,插在所有 #include 之后(此时 <linux/version.h> 已就位),
+# 且远早于第一个调用点。
+marker = "#define KPM_NAME_LEN 32"
+if marker not in src:
+    sys.exit("锚点 '#define KPM_NAME_LEN 32' 未找到 —— kpm.c 结构已变,补丁需人工跟进")
+
+src = src.replace("if (!access_ok(", "if (!ksu_access_ok(")
+
+shim = """/*
+ * ---- 4.19 兼容层(构建时本地追加,非上游代码)----
+ * KPM 按 5.9+ 的两参数 access_ok(addr, size) 写,
+ * 而 4.19 及更早的 arm64 定义是三参数 access_ok(type, addr, size),
+ * 裸调会编译失败。这里按内核版本分派。
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+#define ksu_access_ok(addr, size) access_ok(0, (addr), (size))
+#else
+#define ksu_access_ok(addr, size) access_ok((addr), (size))
+#endif
+
+"""
+src = src.replace(marker, shim + marker, 1)
+
+# 打完必须一条裸调都不剩、且改写数与预期一致,否则又得白跑一轮 40 分钟
+left = src.count("if (!access_ok(")
+done = src.count("if (!ksu_access_ok(")
+if left or done != n:
+    sys.exit(f"替换数量异常: 残留={left} 改写={done} 预期={n},中止")
+if src.count("#define ksu_access_ok") != 2:
+    sys.exit("shim 分支数异常(应为 2),中止")
+
+open(p, "w").write(src)
+print(f"[compat] 改写 {n} 处,残留 0 处,shim 已插入 {p}")
+PY
 
 # ---- AnyKernel3 打包用 ----
 git clone --depth=1 -b kona https://github.com/liyafe1997/AnyKernel3 anykernel
