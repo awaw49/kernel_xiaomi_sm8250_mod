@@ -30,45 +30,52 @@ jobs:
             ccache zip unzip wget cpio bc bison flex make \
             libssl-dev libncurses-dev python3 rsync
 
-      - name: Install AOSP clang (与已验证发布版一致的 clang 17.0.2)
+      # 优先用 AOSP clang 17(与已验证的预编译包同一大版本)。
+      # 目录名/默认分支不写死,运行时从 gitiles 探测,避免写死路径导致 400/404。
+      - name: Install AOSP clang 17
         id: clang_aosp
         continue-on-error: true
         run: |
           set -e
-          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz"
+          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
+          REF=$(curl -fsS "$BASE/?format=JSON" | tail -n +2 \
+                | python3 -c "import sys,json;print(json.load(sys.stdin).get('defaultBranch','main'))")
+          echo "  仓库默认分支: $REF"
+          DIR=$(curl -fsS "$BASE/+/$REF?format=JSON" | tail -n +2 | python3 -c "
+import sys, json, re
+names = [e['name'] for e in json.load(sys.stdin).get('entries', [])]
+c17 = [n for n in names if re.match(r'^clang-r5[01]', n) and re.fullmatch(r'clang-r5[01]\d*[a-z]?', n)]
+c17.sort()
+print(c17[-1] if c17 else '')
+")
+          [ -n "$DIR" ] || { echo "  未探测到 clang 目录"; exit 1; }
+          echo "  选用: $DIR"
           mkdir -p /opt/aosp-clang
-          echo "下载 AOSP clang r487747c ..."
-          curl -fL --retry 2 --connect-timeout 30 "$URL" -o /tmp/clang.tar.gz
+          curl -fL --retry 2 --connect-timeout 30 "$BASE/+archive/refs/heads/$REF/$DIR.tar.gz" -o /tmp/clang.tar.gz
           tar -xzf /tmp/clang.tar.gz -C /opt/aosp-clang
           rm -f /tmp/clang.tar.gz
-          if /opt/aosp-clang/bin/clang --version | grep -q "clang version 17"; then
-            echo "CLANG_BIN=/opt/aosp-clang/bin" >> "$GITHUB_ENV"
-            echo "AOSP clang 17 就绪"
-          else
-            echo "AOSP clang 版本不符"; exit 1
-          fi
+          /opt/aosp-clang/bin/clang --version | tee /tmp/cv
+          grep -qE "clang version 1[6-9]|clang version 2[0-9]" /tmp/cv || { echo "  版本异常"; exit 1; }
+          echo "CLANG_BIN=/opt/aosp-clang/bin" >> "$GITHUB_ENV"
 
-      - name: Install proton-clang 13 (回退方案)
-        id: clang_proton
-        if: steps.clang_aosp.outcome != 'success'
+      # 回退 1:apt 的 clang-17(与 AOSP clang 17.0.2 足够接近)
+      - name: Install clang-17 from apt
+        id: clang_apt17
+        if: always() && steps.clang_aosp.outcome != 'success'
+        continue-on-error: true
         run: |
           set -e
-          mkdir -p /opt/proton && cd /opt/proton
-          curl -fL --retry 2 --connect-timeout 30 \
-            "https://gitlab.com/proton-clang/proton-clang/-/releases/20210522/downloads/proton-clang-20210522.tar.gz" \
-            -o p.tar.gz
-          tar -xzf p.tar.gz && rm -f p.tar.gz
-          D=$(find /opt/proton -maxdepth 1 -type d -name 'proton-clang*' | head -1)
-          echo "CLANG_BIN=$D/bin" >> "$GITHUB_ENV"
-          $D/bin/clang --version | head -1
+          sudo apt-get install -y --no-install-recommends clang-17
+          clang-17 --version | head -1
+          echo "CLANG_BIN=/usr/lib/llvm-17/bin" >> "$GITHUB_ENV"
 
-      - name: Install distro clang (最终回退)
-        if: steps.clang_proton.outcome != 'success'
+      # 回退 2:默认 clang
+      - name: Install default clang
+        if: always() && steps.clang_aosp.outcome != 'success' && steps.clang_apt17.outcome != 'success'
         run: |
           set -e
           sudo apt-get install -y --no-install-recommends clang
           echo "CLANG_BIN=/usr/bin" >> "$GITHUB_ENV"
-          clang --version | head -1
 
       - name: Report toolchain
         run: |
@@ -76,6 +83,7 @@ jobs:
           $CLANG_BIN/clang --version
           aarch64-linux-gnu-ld --version | head -1
           arm-linux-gnueabi-ld --version | head -1
+          echo "--- clang 来源: AOSP=$( [ "$CLANG_BIN" = /opt/aosp-clang/bin ] && echo 是 || echo 否) ---"
           df -h / | tail -1
 
       - name: Build
@@ -86,12 +94,18 @@ jobs:
           set -e
           IMG=dist/Image_cas_sukisu
           test -f "$IMG" || { echo "没有产出 Image"; exit 1; }
-          echo "=== KSU 符号检查 ==="
+          ls -la dist/
+          echo "=== KSU 符号 ==="
           strings -a "$IMG" | grep -c "KernelSU" | xargs echo "  KernelSU 字符串数:"
           strings -a "$IMG" | grep -m1 "Linux version" || true
-          echo "=== kprobes 检查(非 0 才说明 KSU 能挂钩)==="
+          echo "=== kprobes(必须 > 0,否则 KSU 挂不上)==="
           strings -a "$IMG" | grep -cE "^register_kprobe$" | xargs echo "  register_kprobe 命中:"
-          strings -a "$IMG" | grep -i "KPROBES is disabled" && echo "  ⚠️ 仍有 KPROBES 告警" || echo "  ✅ 无 KPROBES 告警"
+          if strings -a "$IMG" | grep -q "KPROBES is disabled"; then
+            echo "  ❌ 内核仍带 KPROBES 告警 —— KSU 会失效"
+            exit 1
+          else
+            echo "  ✅ 无 KPROBES 告警"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
