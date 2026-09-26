@@ -1,20 +1,34 @@
 #!/bin/bash
 # CI 构建:cas (小米10至尊纪念版/apollo) + MIUI 14 + SukiSU
 #
-# 版本锁定说明(重要,别随手改):
-#   上游 v4.2.0 的 hide-SELinux 特性(selinux/sepolicy.c / rules.c / selinux_hide.c)
-#   在这棵 4.19 树上会炸出 83 个错误 —— 4.19 的 selinux_state 没有 policy/status_lock/
-#   status_page,struct selinux_policy 是不完整类型,filename_trans_key 的字段名
-#   (otype/stypes/next)整体不同。那 88 个 SELinux 错误【就是】隐藏 SELinux 的实现本身,
-#   不是能打补丁绕过的胶水层,而是一次从零开始的 4.19 SELinux 移植。
-#   所以:要 4.19,就不能要 v4.2.0 的 hide-SELinux。二者在这台机器上互斥。
+# ---- 为什么锁在这个 commit(2026-09 复核过一遍,别随手换成 main)----
 #
-#   这里锁到 liyafe1997/SukiSU-Ultra@f4863b20(2025-07-09)。该版本的
-#   selinux/*.c 全部有 KERNEL_VERSION 守卫,且 sepolicy.c 里有一条显式的
-#   "< 5.7.0 回退路径"(原注释: "// < 5.7.0, has no filename_trans_key,
-#   but struct filename_trans"),4.19 会正确落进去。
-#   锚点上 ksu_access_ok / MODULE_IMPORT_NS 也都是上游自带且已版本守卫,
-#   所以本脚本不再做任何源码级兼容改写 —— 少改一行就少错一处。
+# 仓库有九条分支,但只有三条线的 kernel/selinux/sepolicy.c 带 <5.7.0 回退分支,
+# 也就是只有它们还能编 4.19。逐个实测的结果:
+#
+#   main / dev / new-wx / releases   2025-09-05  sepolicy.c 853 行  3 项 Kconfig
+#       历史上 2025-03-22 做过 "rewrite the update history",和下面三条【没有
+#       共同祖先】。sepolicy.c 里的 <5.7.0 回退分支被整段删掉,
+#       struct filename_trans_key 变成无条件使用 —— 而 4.19 的
+#       security/selinux/ss/policydb.h 里根本没有这个类型(5.7 才引入),
+#       4.19 上只有 struct filename_trans(u32 stype/ttype + u16 tclass),
+#       用 ebitmap filename_trans_ttypes 表达源类型集合,也没有
+#       compat_filename_trans_count,filename_trans_datum 里也没有 next 指针。
+#       => 编不过,和隐藏不隐藏 SELinux 无关。
+#
+#   nongki                          2025-07-09  sepolicy.c 1070 行  7 项 Kconfig
+#       4.19 能编,但 Kconfig 是 KSU_LSM_SECURITY_HOOKS(把钩子挂 LSM framework),
+#       没有 KSU_MANUAL_HOOK。这台机器不合适:小米把手动挂钩调用点直接焊进了
+#       内核源码(fs/read_write.c:598、fs/exec.c:1954/1987、drivers/input/input.c:458),
+#       而这三个全局变量只在 KSU 的非 kprobes 分支里定义,走 LSM 路径就接不上,
+#       链接 vmlinux 时三个 undefined reference。
+#
+#   susfs-1.5.7                     2025-07-09  sepolicy.c 1070 行 23 项 Kconfig
+#   susfs-main / susfs-test         2025-07-15  sepolicy.c 1070 行 22 项 Kconfig  <= 用这个
+#       两条线的 kernel/selinux/{sepolicy.c,rules.c} 内容【完全相同】(md5 一致),
+#       所以 4.19 兼容性一样;susfs-main 只是多 34 个 commit(动态签名、
+#       CMD_HOOK_TYPE/stat 钩子、多管理器),并且去掉了已废弃的
+#       KSU_SUSFS_SUS_OVERLAYFS。同为 4.19 可用,susfs-main 更新,故取它。
 set -euo pipefail
 
 # 本脚本有多处 GNU 风格 `sed -i 's/../g' file`。macOS 的 BSD sed 语法不同,
@@ -30,10 +44,10 @@ GIT_COMMIT_ID=$(git rev-parse --short=8 HEAD)
 
 # ---- SukiSU 固定版本 ----
 SUKISU_REPO="${SUKISU_REPO:-https://github.com/liyafe1997/SukiSU-Ultra}"
-SUKISU_REF="${SUKISU_REF:-f4863b20cc8dc0f8cc67418980f022e43014b598}"
+SUKISU_REF="${SUKISU_REF:-329b7f59dc84d79ac27a3487cf21d90c01cdf656}"
 # 打在 zip 文件名里的标签。锁的是 commit 不是 tag,这里用日期+短 sha 标,
 # 免得文件名上写着 v4.2.0 结果内容完全是另一回事。
-KSU_LABEL="${KSU_LABEL:-f4863b20-4.19-compatible}"
+KSU_LABEL="${KSU_LABEL:-329b7f59-4.19-nongki}"
 
 # ---- 工具链:CI 里用 clang + 交叉 binutils ----
 if [ -z "${CLANG_BIN:-}" ]; then
@@ -213,7 +227,7 @@ sed -i 's/\/\/39 01 00 00 11 00 03 51 03 FF/39 01 00 00 11 00 03 51 03 FF/g' ${d
 make $MAKE_ARGS ${TARGET_DEVICE}_defconfig
 
 # ---- 内核选项 ----
-# 选项名严格对齐 f4863b20 的 kernel/Kconfig,不去 enable 那个版本上不存在的符号
+# 选项名严格对齐 329b7f59 的 kernel/Kconfig,不去 enable 那个版本上不存在的符号
 # (scripts/config 对不存在的选项照样会写一行 "# CONFIG_X is not set",无害但会误导人)。
 #
 # KSU_MANUAL_HOOK 必须【开】,这是这棵树出厂就决定的,不是可选项:
@@ -242,6 +256,10 @@ scripts/config --file out/.config \
 # SUSFS 整组关掉:SUSFS 是内核树侧的东西(kernel/Makefile 里靠 test -e fs/susfs.c 探测),
 # 这棵树没集成 susfs4ksu,留着 KSU_SUSFS=y 只会写一堆没人读的 .config 项。
 # 真要 SUSFS 得先按 gitlab.com/simonpunk/susfs4ksu 打补丁,那是另一件事。
+#
+# 选项名对齐 329b7f59 的 kernel/Kconfig。该版本相对 1.5.7 删掉了已废弃的
+# KSU_SUSFS_SUS_OVERLAYFS,所以下面这一行比 1.5.7 少一条 —— 别照抄旧列表,
+# scripts/config 遇到不存在的选项会写一行 "# CONFIG_X is not set",无害但误导人。
 scripts/config --file out/.config \
     -d KSU_SUSFS \
     -d KSU_SUSFS_HAS_MAGIC_MOUNT \
@@ -250,13 +268,13 @@ scripts/config --file out/.config \
     -d KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
     -d KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
     -d KSU_SUSFS_SUS_KSTAT \
-    -d KSU_SUSFS_SUS_OVERLAYFS \
     -d KSU_SUSFS_TRY_UMOUNT \
     -d KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
     -d KSU_SUSFS_SPOOF_UNAME \
     -d KSU_SUSFS_ENABLE_LOG \
     -d KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-    -d KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+    -d KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+    -d KSU_SUSFS_OPEN_REDIRECT
 
 # KPM 靠 select 拉进来的 KALLSYMS_ALL 会把全量符号名塞进 Image。
 # 这正好让 CI 的 strings 校验能真的查到 KernelSU 符号,而不是靠字符串残留蒙。
@@ -318,10 +336,12 @@ echo "[build] Image 生成成功"
 
 find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > out/arch/arm64/boot/dtb
 
-# ---- KPM 基础设施:编译后必须再 patch 一次内核,管理器才能嵌 selinux_hook ----
-# 注意:这是 KPM 运行时加载模块的"接收端",不是编译期嵌 selinux_hook。
-# 隐藏 SELinux 修改需要 KSU 管理器在刷入后执行「重新修补镜像」把 selinux_hook
-# 这个 KPM 塞进来;4.19 上即使塞了也未必能工作(理由见文件头)。
+# ---- KPM 基础设施:编译后必须再 patch 一次内核 ----
+# 这是 KPM 运行时加载模块的"接收端":没有这一步,Image 里没有 KPM 头,
+# 管理器的 KPM 页就加载不了任何 .kpm。
+# 注意别把它和"隐藏 SELinux 修改"混为一谈 —— 后者在 SukiSU 这边是刷机后由
+# 管理器注入 KPM 实现的,不是本脚本的编译产物(具体能不能用还没验证过,
+# 仓库里也没找到叫这个名字的开关)。本脚本只负责把接收端打好。
 echo "[KPM] patch_linux 打补丁 ..."
 cd out/arch/arm64/boot
 wget -q -O patch_linux https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
