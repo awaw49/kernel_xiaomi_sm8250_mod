@@ -216,15 +216,25 @@ make $MAKE_ARGS ${TARGET_DEVICE}_defconfig
 # 选项名严格对齐 f4863b20 的 kernel/Kconfig,不去 enable 那个版本上不存在的符号
 # (scripts/config 对不存在的选项照样会写一行 "# CONFIG_X is not set",无害但会误导人)。
 #
-# KSU_MANUAL_HOOK 必须关:它的 help 写得很直白 —— "If enabled, hook with manually-patched
-# function; if disabled, hook with Kernel-probe"。cas_defconfig 里 kprobes 一条都没有,
-# 我们已经在 defconfig 里补了 CONFIG_KPROBES=y,所以走 kprobe 这条被充分验证过的路。
-# (社区那个 cas 预编译包 Image 里 register_kprobe 命中数为 0,正是因为开了 MANUAL_HOOK。)
+# KSU_MANUAL_HOOK 必须【开】,这是这棵树出厂就决定的,不是可选项:
+# 小米把 KernelSU 的手动挂钩调用点直接焊进了内核源码 ——
+#   fs/read_write.c:598        调 ksu_vfs_read_hook()
+#   fs/exec.c:1954 / :1987     调 ksu_execveat_hook()
+#   drivers/input/input.c:458  调 ksu_input_hook()
+# 而这三个全局变量在 SukiSU 里是 ksud.c:52 那个 #ifdef 的【else】分支里定义的:
+#   #ifdef CONFIG_KSU_KPROBES_HOOK ... #else bool ksu_vfs_read_hook = true; ...
+# KPROBES 模式不会定义它们,可内核树里的调用点是按 #ifdef CONFIG_KSU 守卫的,
+# 与 MANUAL_HOOK 无关 —— 于是 CONFIG_KSU 一开,调用点就激活,而没有定义,
+# 最后链接 vmlinux 时三个 undefined reference,rc=2。
+# 所以:既然树里已经预埋了手动调用点,就必须让 KSU 走手动路径把它们接上。
+# (KPROBES 模式要求内核侧调用点被摘掉,那是改内核树,没有必要。)
+# 反过来这也解释了社区那个 cas 预编译包:它 Image 里 register_kprobe 命中为 0,
+# 不是"装饰品",而是它本来就走的 MANUAL_HOOK 路径。
 scripts/config --file out/.config \
     -e KSU \
     -e KPM \
+    -e KSU_MANUAL_HOOK \
     -d KSU_DEBUG \
-    -d KSU_MANUAL_HOOK \
     -d KSU_CMDLINE \
     -d KSU_ALLOWLIST_WORKAROUND \
     -d KSU_MULTI_MANAGER_SUPPORT
