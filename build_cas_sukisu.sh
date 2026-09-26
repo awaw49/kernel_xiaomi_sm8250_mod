@@ -1,9 +1,23 @@
 #!/bin/bash
-# CI 构建:cas (小米10至尊纪念版) + MIUI + SukiSU v4.2.0
-# 由 awaw49 在 fork 上新增,用于 GitHub Actions 出包
+# CI 构建:cas (小米10至尊纪念版/apollo) + MIUI 14 + SukiSU
+#
+# 版本锁定说明(重要,别随手改):
+#   上游 v4.2.0 的 hide-SELinux 特性(selinux/sepolicy.c / rules.c / selinux_hide.c)
+#   在这棵 4.19 树上会炸出 83 个错误 —— 4.19 的 selinux_state 没有 policy/status_lock/
+#   status_page,struct selinux_policy 是不完整类型,filename_trans_key 的字段名
+#   (otype/stypes/next)整体不同。那 88 个 SELinux 错误【就是】隐藏 SELinux 的实现本身,
+#   不是能打补丁绕过的胶水层,而是一次从零开始的 4.19 SELinux 移植。
+#   所以:要 4.19,就不能要 v4.2.0 的 hide-SELinux。二者在这台机器上互斥。
+#
+#   这里锁到 liyafe1997/SukiSU-Ultra@f4863b20(2025-07-09)。该版本的
+#   selinux/*.c 全部有 KERNEL_VERSION 守卫,且 sepolicy.c 里有一条显式的
+#   "< 5.7.0 回退路径"(原注释: "// < 5.7.0, has no filename_trans_key,
+#   but struct filename_trans"),4.19 会正确落进去。
+#   锚点上 ksu_access_ok / MODULE_IMPORT_NS 也都是上游自带且已版本守卫,
+#   所以本脚本不再做任何源码级兼容改写 —— 少改一行就少错一处。
 set -euo pipefail
 
-# 本脚本有 ~60 处 GNU 风格 `sed -i 's/../g' file`。macOS 的 BSD sed 语法不同,
+# 本脚本有多处 GNU 风格 `sed -i 's/../g' file`。macOS 的 BSD sed 语法不同,
 # 这些命令会静默失败(不报错、也不改文件),结果是 dts 补丁全丢但构建照样跑完,
 # 出一个"看着成功"实则没打 MIUI 补丁的包。与其让它悄悄错,不如直接拦下。
 if ! sed --version >/dev/null 2>&1; then
@@ -13,9 +27,15 @@ fi
 
 TARGET_DEVICE=cas
 GIT_COMMIT_ID=$(git rev-parse --short=8 HEAD)
-SUKISU_TAG="${SUKISU_TAG:-v4.2.0}"
 
-# ---- 工具链:CI 里用 AOSP clang + 交叉 binutils ----
+# ---- SukiSU 固定版本 ----
+SUKISU_REPO="${SUKISU_REPO:-https://github.com/liyafe1997/SukiSU-Ultra}"
+SUKISU_REF="${SUKISU_REF:-f4863b20cc8dc0f8cc67418980f022e43014b598}"
+# 打在 zip 文件名里的标签。锁的是 commit 不是 tag,这里用日期+短 sha 标,
+# 免得文件名上写着 v4.2.0 结果内容完全是另一回事。
+KSU_LABEL="${KSU_LABEL:-f4863b20-4.19-compatible}"
+
+# ---- 工具链:CI 里用 clang + 交叉 binutils ----
 if [ -z "${CLANG_BIN:-}" ]; then
     echo "错误:请设置 CLANG_BIN 环境变量指向 clang 的 bin 目录"; exit 1
 fi
@@ -29,121 +49,65 @@ MAKE_ARGS="ARCH=arm64 SUBARCH=arm64 O=out CC=clang \
 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
 CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
 
-# ---- 装 SukiSU(v4 的 setup.sh 接口:收 tag/commit,不再收 SUSFS commit) ----
-echo "[SukiSU] 安装 ${SUKISU_TAG} ..."
-curl -LSs "https://github.com/SukiSU-Ultra/SukiSU-Ultra/raw/${SUKISU_TAG}/kernel/setup.sh" | sh -s "${SUKISU_TAG}"
-test -d KernelSU/kernel || { echo "SukiSU 安装失败"; exit 1; }
-echo "[SukiSU] 实际版本: $(cd KernelSU && git describe --tags 2>/dev/null || echo unknown)"
+# ---- 装 SukiSU ----
+# 这里没用上游 kernel/setup.sh,而是自己 clone + checkout + 挂 symlink + 改
+# drivers/{Makefile,Kconfig}。原因:setup.sh 把仓库 URL 写死在函数体里,换 fork
+# 就得把它的源码 sed 掉再管道给 sh;自己写这 4 步既能控制 checkout 的 commit,
+# 也能对"挂上了没有"做硬断言 —— setup.sh 里那句
+#   grep -q "kernelsu" $DRIVER_MAKEFILE || printf ... && echo
+# 用了 `||` 和 `&&` 混 precedence,一旦 grep 命中就整条短路,append 不执行也不报错,
+# 后面照样接着跑,最后产出一个没有 KSU 的内核。
+echo "[SukiSU] clone ${SUKISU_REPO} @ ${SUKISU_REF}"
+rm -rf KernelSU
+git clone --filter=blob:none "${SUKISU_REPO}" KernelSU
+git -C KernelSU checkout --detach "${SUKISU_REF}"
+echo "[SukiSU] HEAD = $(git -C KernelSU rev-parse HEAD)"
+echo "[SukiSU] 提交: $(git -C KernelSU log -1 --format='%ad %s' --date=short)"
 
-# ---- 4.19 兼容:KPM 用了两参数 access_ok,而 4.19 的 arm64 还是三参数 ----
-# 上游 v4.2.0 的 kpm.c 里 10 处 access_ok() 全是裸调、零版本保护,在这棵 4.19
-# 树上会直接报 "too few arguments provided to function-like macro invocation"。
-# 按仓库自己 kernel/infra/file_wrapper.c 的 #if/#elif/#else 范式补一个包装宏,
-# 只在 <5.9 时走三参数分支;不改上游任何逻辑,只换调用点。
-KPM_C=KernelSU/kernel/kpm/kpm.c
-python3 - "$KPM_C" <<'PY'
-import sys
+# 挂进 drivers/ —— 必须是相对 symlink,kbuild 才能找到源文件
+ln -sfn ../KernelSU/kernel drivers/kernelsu
+test -f drivers/kernelsu/Kconfig || { echo "错误:symlink 没挂上"; exit 1; }
 
-p = sys.argv[1]
-src = open(p).read()
+# 把 kernelsu 接进 drivers 的构建
+if ! grep -q 'drivers/kernelsu\|obj-\$(CONFIG_KSU) += kernelsu' drivers/Makefile; then
+    printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+    echo "[SukiSU] drivers/Makefile 已加 obj-\$(CONFIG_KSU) += kernelsu/"
+fi
+if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+    sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+    echo "[SukiSU] drivers/Kconfig 已加 source"
+fi
 
-# 幂等守卫必须看 shim 的【定义行】,不能看 ksu_access_ok 这个名字 ——
-# 调用点改写之后这个名字必然出现在文件里,拿它当判据会自己把自己拦下来。
-if "#define ksu_access_ok" in src:
-    print("[compat] 兼容层已存在,跳过")
-    sys.exit(0)
-
-n = src.count("if (!access_ok(")
-if n == 0:
-    print("[compat] 上游已无裸调 access_ok,跳过")
-    sys.exit(0)
-
-# 锚点取自 kpm.c:41,插在所有 #include 之后(此时 <linux/version.h> 已就位),
-# 且远早于第一个调用点。
-marker = "#define KPM_NAME_LEN 32"
-if marker not in src:
-    sys.exit("锚点 '#define KPM_NAME_LEN 32' 未找到 —— kpm.c 结构已变,补丁需人工跟进")
-
-src = src.replace("if (!access_ok(", "if (!ksu_access_ok(")
-
-shim = """/*
- * ---- 4.19 兼容层(构建时本地追加,非上游代码)----
- * KPM 按 5.9+ 的两参数 access_ok(addr, size) 写,
- * 而 4.19 及更早的 arm64 定义是三参数 access_ok(type, addr, size),
- * 裸调会编译失败。这里按内核版本分派。
- */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
-#define ksu_access_ok(addr, size) access_ok(0, (addr), (size))
-#else
-#define ksu_access_ok(addr, size) access_ok((addr), (size))
-#endif
-
-"""
-src = src.replace(marker, shim + marker, 1)
-
-# 打完必须一条裸调都不剩、且改写数与预期一致,否则又得白跑一轮 40 分钟
-left = src.count("if (!access_ok(")
-done = src.count("if (!ksu_access_ok(")
-if left or done != n:
-    sys.exit(f"替换数量异常: 残留={left} 改写={done} 预期={n},中止")
-if src.count("#define ksu_access_ok") != 2:
-    sys.exit("shim 分支数异常(应为 2),中止")
-
-open(p, "w").write(src)
-print(f"[compat] 改写 {n} 处,残留 0 处,shim 已插入 {p}")
-PY
-
-# ---- 4.19 兼容:MODULE_IMPORT_NS 是 5.4+ 才有的宏 ----
-# v4.2.0 的 core/init.c 无条件调用它(两处,分别在 >=6.13 / #else 分支里)。
-# 4.19 的 include/linux/module.h 没有这个定义,预处理器把整个宏当普通标识符吞掉,
-# 剩下的 (name); 被 clang 解析成隐式 int 的函数定义,报 "type specifier missing"。
-#
-# 这里不定义空宏,而是直接把语句换成注释:4.19 压根没有模块命名空间机制,
-# 这个导入在 4.19 上本就是无意义的空操作,删掉语义正确。
-# 之所以不#define 成空:展开后是文件作用域的裸 ';',ISO C 不允许,
-# 而这棵树的诊断标签是 [-Werror,-Wimplicit-int],说明确实开了 -Werror,赌不起。
-KSU_INIT=KernelSU/kernel/core/init.c
-python3 - "$KSU_INIT" <<'PY'
-import re
-import sys
-
-p = sys.argv[1]
-src = open(p).read()
-
-MARK = "K4_19_NS_STRIP"
-if MARK in src:
-    print("[compat] MODULE_IMPORT_NS 已处理,跳过")
-    sys.exit(0)
-
-# 整行都是该宏的独立语句才算,避免误伤 include、条件编译里的其他引用
-PAT = re.compile(r"^[ \t]*MODULE_IMPORT_NS\(.*\);[ \t]*$", re.M)
-n = len(PAT.findall(src))
-if n == 0:
-    print("[compat] 上游已无独立的 MODULE_IMPORT_NS 语句,跳过")
-    sys.exit(0)
-
-src = PAT.sub(f"/* {MARK}: 4.19 无模块命名空间机制(5.4+ 才有),此导入无意义,已移除 */", src)
-
-# 替换后不能再有任何形式的调用残留
-left = src.count("MODULE_IMPORT_NS(")
-if left:
-    sys.exit(f"仍有 {left} 处 MODULE_IMPORT_NS( 残留(可能是非独立语句的用法,需人工处理),中止")
-if src.count(MARK) != n:
-    sys.exit(f"注释标记数 {src.count(MARK)} != 预期 {n},中止")
-
-open(p, "w").write(src)
-print(f"[compat] 已移除 {n} 处 MODULE_IMPORT_NS 导入 -> {p}")
-PY
+# 4.19 这棵树告警致命(诊断标签是 [-Werror,-Wimplicit-int]),而 CI 用的是
+# clang 17、上游当年是 proton-clang 12 —— 新版 clang 对同一份代码吐的新告警
+# 会直接顶死构建,而那些告警无一影响 KSU 功能。给 KSU 子目录单独关掉 -Werror。
+# 追加在文件末尾:上游 Makefile 结尾有 "Keep a new line here!!" 的显式邀请。
+if ! grep -q 'KSU_NO_WERROR_MARK' drivers/kernelsu/Makefile; then
+    printf '\n# KSU_NO_WERROR_MARK: 4.19 + clang17 的新告警不应杀死 KSU 子树\nccflags-y += -Wno-error\n' >> drivers/kernelsu/Makefile
+    echo "[SukiSU] 已给 KSU 子目录加 -Wno-error"
+fi
 
 # ---- 预检:只编 KSU 目录 ----
-# 整棵树要 12 分钟才走到 drivers/kernelsu,4.19 兼容问题一个一个冒出来、一轮 12 分钟。
+# 整棵树要十几分钟才走到 drivers/kernelsu,4.19 兼容问题一个一个冒出来、一轮十几分钟。
 # 这里先把 KSU 单独编出来,配合 -k 一次把剩下所有不兼容点全收齐,再决定要不要跑整树。
 echo "[preflight] 单独编译 drivers/kernelsu(配 -k 一次收全所有错误)..."
 make $MAKE_ARGS ${TARGET_DEVICE}_defconfig >/dev/null
 scripts/config --file out/.config -e KSU -e KPM
-rm -rf out/drivers/kernelsu out/arch/arm64/boot/dts 2>/dev/null || true
-if make $MAKE_ARGS -k drivers/kernelsu >/tmp/preflight.log 2>&1; then
-    echo "[preflight] ✅ KSU 目录编译通过"
+rm -rf out/drivers/kernelsu 2>/dev/null || true
+rm -f /tmp/preflight.log
+
+# 目标名必须带结尾斜杠。kbuild 对已存在的目录目标不做任何事,make 视为 up-to-date
+# 直接 exit 0 —— 那样预检就是空跑:上一轮 13 秒报"编译通过",整树阶段照样 83 个错误。
+# 所以光看退出码不够,还要数 .o。KSU 有 9 个 + selinux 3 个 + kpm 3 个 = 15 个源文件,
+# 门槛设 5 既有足够区分度,又不会因为内核版本差异导致误报。
+if make $MAKE_ARGS -k drivers/kernelsu/ >/tmp/preflight.log 2>&1; then
+    NOBJ=$(find out/drivers/kernelsu -name '*.o' 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${NOBJ:-0}" -lt 5 ]; then
+        echo "[preflight] ❌ make 退出 0 但只产出 ${NOBJ} 个 .o —— 预检在空跑,不可信"
+        grep -E "Nothing to be done|No rule to make target" /tmp/preflight.log | head -8
+        exit 1
+    fi
+    echo "[preflight] ✅ KSU 目录编译通过(${NOBJ} 个 .o)"
 else
     if grep -q "No rule to make target" /tmp/preflight.log; then
         # 目标名在这个内核版本上不认,不是真错误,放行让整树编译去暴露问题
@@ -223,15 +187,44 @@ sed -i 's/\/\/39 01 00 00 11 00 03 51 03 FF/39 01 00 00 11 00 03 51 03 FF/g' ${d
 
 make $MAKE_ARGS ${TARGET_DEVICE}_defconfig
 
-# ---- 内核选项:KSU v4 + MIUI 专属 ----
-    scripts/config --file out/.config \
-        -e KSU \
-        -e KPM \
-        -d KSU_DEBUG \
-        -d KSU_MANUAL_SU \
-        -d KSU_DISABLE_MANAGER \
-        -d KSU_DISABLE_POLICY
+# ---- 内核选项 ----
+# 选项名严格对齐 f4863b20 的 kernel/Kconfig,不去 enable 那个版本上不存在的符号
+# (scripts/config 对不存在的选项照样会写一行 "# CONFIG_X is not set",无害但会误导人)。
+#
+# KSU_MANUAL_HOOK 必须关:它的 help 写得很直白 —— "If enabled, hook with manually-patched
+# function; if disabled, hook with Kernel-probe"。cas_defconfig 里 kprobes 一条都没有,
+# 我们已经在 defconfig 里补了 CONFIG_KPROBES=y,所以走 kprobe 这条被充分验证过的路。
+# (社区那个 cas 预编译包 Image 里 register_kprobe 命中数为 0,正是因为开了 MANUAL_HOOK。)
+scripts/config --file out/.config \
+    -e KSU \
+    -e KPM \
+    -d KSU_DEBUG \
+    -d KSU_MANUAL_HOOK \
+    -d KSU_CMDLINE \
+    -d KSU_ALLOWLIST_WORKAROUND \
+    -d KSU_MULTI_MANAGER_SUPPORT
 
+# SUSFS 整组关掉:SUSFS 是内核树侧的东西(kernel/Makefile 里靠 test -e fs/susfs.c 探测),
+# 这棵树没集成 susfs4ksu,留着 KSU_SUSFS=y 只会写一堆没人读的 .config 项。
+# 真要 SUSFS 得先按 gitlab.com/simonpunk/susfs4ksu 打补丁,那是另一件事。
+scripts/config --file out/.config \
+    -d KSU_SUSFS \
+    -d KSU_SUSFS_HAS_MAGIC_MOUNT \
+    -d KSU_SUSFS_SUS_PATH \
+    -d KSU_SUSFS_SUS_MOUNT \
+    -d KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+    -d KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+    -d KSU_SUSFS_SUS_KSTAT \
+    -d KSU_SUSFS_SUS_OVERLAYFS \
+    -d KSU_SUSFS_TRY_UMOUNT \
+    -d KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+    -d KSU_SUSFS_SPOOF_UNAME \
+    -d KSU_SUSFS_ENABLE_LOG \
+    -d KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+    -d KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+
+# KPM 靠 select 拉进来的 KALLSYMS_ALL 会把全量符号名塞进 Image。
+# 这正好让 CI 的 strings 校验能真的查到 KernelSU 符号,而不是靠字符串残留蒙。
 scripts/config --file out/.config \
     --set-str STATIC_USERMODEHELPER_PATH /system/bin/micd \
     -e PERF_CRITICAL_RT_TASK	\
@@ -261,8 +254,14 @@ scripts/config --file out/.config \
     -e MI_RECLAIM \
     -e RTMM \
 
+# 打印实际生效的关键选项,免得"配了但没生效"这种事静默过去
+echo "===== 生效的关键选项 ====="
+grep -E '^CONFIG_(KSU|KPM|KSU_MANUAL_HOOK|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL)=' out/.config || true
+grep -E '^# CONFIG_(KSU_MANUAL_HOOK|KSU_DEBUG|KPROBES) is not set' out/.config || true
+echo "============================="
+
 # -k:一次把剩下所有错误收齐,而不是撞上第一个就停。
-# 每轮整树编译 12 分钟,一轮只换一个错误太亏。
+# 每轮整树编译十几分钟,一轮只换一个错误太亏。
 set +e
 make $MAKE_ARGS -k -j$(nproc) 2>&1 | tee /tmp/build.log
 rc=${PIPESTATUS[0]}
@@ -280,9 +279,12 @@ echo "[build] Image 生成成功"
 find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > out/arch/arm64/boot/dtb
 
 # ---- KPM 基础设施:编译后必须再 patch 一次内核,管理器才能嵌 selinux_hook ----
+# 注意:这是 KPM 运行时加载模块的"接收端",不是编译期嵌 selinux_hook。
+# 隐藏 SELinux 修改需要 KSU 管理器在刷入后执行「重新修补镜像」把 selinux_hook
+# 这个 KPM 塞进来;4.19 上即使塞了也未必能工作(理由见文件头)。
 echo "[KPM] patch_linux 打补丁 ..."
 cd out/arch/arm64/boot
-wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
+wget -q -O patch_linux https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
 chmod +x patch_linux
 ./patch_linux
 rm -f Image && mv oImage Image
@@ -297,7 +299,7 @@ mkdir -p dist
 cp out/arch/arm64/boot/Image dist/Image_cas_sukisu
 
 cd anykernel
-zip -r9 "../dist/Kernel_MIUI_${TARGET_DEVICE}_SukiSU-${SUKISU_TAG}_$(date +'%Y%m%d_%H%M%S')_anykernel3_${GIT_COMMIT_ID}.zip" ./* -x .git .gitignore out/ ./*.zip
+zip -r9 "../dist/Kernel_MIUI_${TARGET_DEVICE}_SukiSU-${KSU_LABEL}_$(date +'%Y%m%d_%H%M%S')_anykernel3_${GIT_COMMIT_ID}.zip" ./* -x .git .gitignore out/ ./*.zip
 cd ..
 
 echo "===== 完成 ====="
