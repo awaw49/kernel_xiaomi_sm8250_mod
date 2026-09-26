@@ -125,12 +125,103 @@ gen_flask_header() {
     echo "[genhdr] ✅ $f ($(wc -c < "$f" | tr -d ' ') 字节)"
 }
 
+apply_config() {
+# 唯一的配置来源。预检和整树编译都调这个函数 —— 绝不允许两处各写一份。
+#
+# 踩过的坑:预检原来只 `scripts/config -e KSU -e KPM`,没关 SUSFS。而
+# config KSU_SUSFS 的 Kconfig 默认值是 `default y`(只 depends on KSU),
+# 于是预检那次编译里 CONFIG_KSU_SUSFS / _SUS_PATH / _SUS_MOUNT 全是开的,
+# core_hook.c 里那几段被守卫的代码照样进编译,报出
+# "use of undeclared identifier 'CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH'"。
+# 真正的整树编译因为后面有 -d KSU_SUSFS 本来是能过的 —— 也就是说预检对着
+# 一份【和真构建不同的配置】给假警报,而它唯一的价值就是"提前 30 分钟报错",
+# 一旦配置分叉就从省时间变成白烧一轮 runner。共用函数就是为了根除这个。
+scripts/config --file out/.config \
+    -e KSU \
+    -e KPM \
+    -e KSU_MANUAL_HOOK \
+    -d KSU_DEBUG \
+    -d KSU_CMDLINE \
+    -d KSU_ALLOWLIST_WORKAROUND \
+    -d KSU_MULTI_MANAGER_SUPPORT
+
+# SUSFS 整组关掉,而且是【必须】关:KSU_SUSFS 的 Kconfig 默认值是 y,不显式关
+# 它就会按默认打开,而 SUSFS 依赖内核树侧的 fs/susfs.c(susfs4ksu 补丁),
+# 这棵树没有 —— 结果就是 core_hook.c 引用一批不存在的 CMD_SUSFS_* 标识符。
+# SUSFS 是内核树侧的东西(kernel/Makefile 里靠 test -e fs/susfs.c 探测),
+# 真要它得先按 gitlab.com/simonpunk/susfs4ksu 打补丁,那是另一件事。
+#
+# 选项名对齐 329b7f59 的 kernel/Kconfig。该版本相对 1.5.7 删掉了已废弃的
+# KSU_SUSFS_SUS_OVERLAYFS,所以下面比 1.5.7 少一条 —— 别照抄旧列表,
+# scripts/config 遇到不存在的选项会写一行 "# CONFIG_X is not set",无害但误导人。
+scripts/config --file out/.config \
+    -d KSU_SUSFS \
+    -d KSU_SUSFS_HAS_MAGIC_MOUNT \
+    -d KSU_SUSFS_SUS_PATH \
+    -d KSU_SUSFS_SUS_MOUNT \
+    -d KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+    -d KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+    -d KSU_SUSFS_SUS_KSTAT \
+    -d KSU_SUSFS_TRY_UMOUNT \
+    -d KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+    -d KSU_SUSFS_SPOOF_UNAME \
+    -d KSU_SUSFS_ENABLE_LOG \
+    -d KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+    -d KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+    -d KSU_SUSFS_OPEN_REDIRECT
+
+# KPM 靠 select 拉进来的 KALLSYMS_ALL 会把全量符号名塞进 Image。
+# 这正好让 CI 的 strings 校验能真的查到 KernelSU 符号,而不是靠字符串残留蒙。
+scripts/config --file out/.config \
+    --set-str STATIC_USERMODEHELPER_PATH /system/bin/micd \
+    -e PERF_CRITICAL_RT_TASK	\
+    -e SF_BINDER		\
+    -e OVERLAY_FS		\
+    -d DEBUG_FS \
+    -e MIGT \
+    -e MIGT_ENERGY_MODEL \
+    -e MIHW \
+    -e PACKAGE_RUNTIME_INFO \
+    -e BINDER_OPT \
+    -e KPERFEVENTS \
+    -e MILLET \
+    -e PERF_HUMANTASK \
+    -d LTO_CLANG \
+    -d LOCALVERSION_AUTO \
+    -e SF_BINDER \
+    -e XIAOMI_MIUI \
+    -d MI_MEMORY_SYSFS \
+    -e TASK_DELAY_ACCT \
+    -e MIUI_ZRAM_MEMORY_TRACKING \
+    -d CONFIG_MODULE_SIG_SHA512 \
+    -d CONFIG_MODULE_SIG_HASH \
+    -e MI_FRAGMENTION \
+    -e PERF_HELPER \
+    -e BOOTUP_RECLAIM \
+    -e MI_RECLAIM \
+    -e RTMM \
+
+# 打印实际生效的关键选项,免得"配了但没生效"这种事静默过去。
+# SUSFS 也一并打出来:它默认值是 y,是最容易"忘了关"的一个。
+echo "===== 生效的关键选项 ====="
+grep -E '^CONFIG_(KSU|KPM|KSU_MANUAL_HOOK|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL)=' out/.config || true
+grep -E '^# CONFIG_(KSU_MANUAL_HOOK|KSU_DEBUG|KPROBES) is not set' out/.config || true
+echo "--- SUSFS 应全部关闭 ---"
+if grep -qE '^CONFIG_KSU_SUSFS' out/.config; then
+    echo "❌ CONFIG_KSU_SUSFS* 仍处于打开状态,KSU 子树会引用不存在的 fs/susfs.c"
+    grep -E '^CONFIG_KSU_SUSFS' out/.config
+    exit 1
+fi
+echo "  ✅ 无 CONFIG_KSU_SUSFS* 打开"
+echo "============================="
+}
+
 # ---- 预检:只编 KSU 目录 ----
 # 整棵树要十几分钟才走到 drivers/kernelsu,4.19 兼容问题一个一个冒出来、一轮十几分钟。
 # 这里先把 KSU 单独编出来,配合 -k 一次把剩下所有不兼容点全收齐,再决定要不要跑整树。
 echo "[preflight] 单独编译 drivers/kernelsu(配 -k 一次收全所有错误)..."
 make $MAKE_ARGS ${TARGET_DEVICE}_defconfig >/dev/null
-scripts/config --file out/.config -e KSU -e KPM
+apply_config
 gen_flask_header
 rm -rf out/drivers/kernelsu 2>/dev/null || true
 rm -f /tmp/preflight.log
@@ -223,7 +314,6 @@ sed -i 's/\/\/39 01 00 00 00 00 05 51 07 FF 00 00/39 01 00 00 00 00 05 51 07 FF 
 sed -i 's/\/\/39 01 00 00 00 00 05 51 07 FF 00 00/39 01 00 00 00 00 05 51 07 FF 00 00/g' ${dts_source}/dsi-panel-j2s-mp-42-02-0a-dsc-cmd.dtsi
 sed -i 's/\/\/39 01 00 00 01 00 03 51 03 FF/39 01 00 00 01 00 03 51 03 FF/g' ${dts_source}/dsi-panel-j11-38-08-0a-fhd-cmd.dtsi
 sed -i 's/\/\/39 01 00 00 11 00 03 51 03 FF/39 01 00 00 11 00 03 51 03 FF/g' ${dts_source}/dsi-panel-j2-p2-1-38-0c-0a-dsc-cmd.dtsi
-
 make $MAKE_ARGS ${TARGET_DEVICE}_defconfig
 
 # ---- 内核选项 ----
@@ -244,74 +334,7 @@ make $MAKE_ARGS ${TARGET_DEVICE}_defconfig
 # (KPROBES 模式要求内核侧调用点被摘掉,那是改内核树,没有必要。)
 # 反过来这也解释了社区那个 cas 预编译包:它 Image 里 register_kprobe 命中为 0,
 # 不是"装饰品",而是它本来就走的 MANUAL_HOOK 路径。
-scripts/config --file out/.config \
-    -e KSU \
-    -e KPM \
-    -e KSU_MANUAL_HOOK \
-    -d KSU_DEBUG \
-    -d KSU_CMDLINE \
-    -d KSU_ALLOWLIST_WORKAROUND \
-    -d KSU_MULTI_MANAGER_SUPPORT
-
-# SUSFS 整组关掉:SUSFS 是内核树侧的东西(kernel/Makefile 里靠 test -e fs/susfs.c 探测),
-# 这棵树没集成 susfs4ksu,留着 KSU_SUSFS=y 只会写一堆没人读的 .config 项。
-# 真要 SUSFS 得先按 gitlab.com/simonpunk/susfs4ksu 打补丁,那是另一件事。
-#
-# 选项名对齐 329b7f59 的 kernel/Kconfig。该版本相对 1.5.7 删掉了已废弃的
-# KSU_SUSFS_SUS_OVERLAYFS,所以下面这一行比 1.5.7 少一条 —— 别照抄旧列表,
-# scripts/config 遇到不存在的选项会写一行 "# CONFIG_X is not set",无害但误导人。
-scripts/config --file out/.config \
-    -d KSU_SUSFS \
-    -d KSU_SUSFS_HAS_MAGIC_MOUNT \
-    -d KSU_SUSFS_SUS_PATH \
-    -d KSU_SUSFS_SUS_MOUNT \
-    -d KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
-    -d KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
-    -d KSU_SUSFS_SUS_KSTAT \
-    -d KSU_SUSFS_TRY_UMOUNT \
-    -d KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
-    -d KSU_SUSFS_SPOOF_UNAME \
-    -d KSU_SUSFS_ENABLE_LOG \
-    -d KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-    -d KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-    -d KSU_SUSFS_OPEN_REDIRECT
-
-# KPM 靠 select 拉进来的 KALLSYMS_ALL 会把全量符号名塞进 Image。
-# 这正好让 CI 的 strings 校验能真的查到 KernelSU 符号,而不是靠字符串残留蒙。
-scripts/config --file out/.config \
-    --set-str STATIC_USERMODEHELPER_PATH /system/bin/micd \
-    -e PERF_CRITICAL_RT_TASK	\
-    -e SF_BINDER		\
-    -e OVERLAY_FS		\
-    -d DEBUG_FS \
-    -e MIGT \
-    -e MIGT_ENERGY_MODEL \
-    -e MIHW \
-    -e PACKAGE_RUNTIME_INFO \
-    -e BINDER_OPT \
-    -e KPERFEVENTS \
-    -e MILLET \
-    -e PERF_HUMANTASK \
-    -d LTO_CLANG \
-    -d LOCALVERSION_AUTO \
-    -e SF_BINDER \
-    -e XIAOMI_MIUI \
-    -d MI_MEMORY_SYSFS \
-    -e TASK_DELAY_ACCT \
-    -e MIUI_ZRAM_MEMORY_TRACKING \
-    -d CONFIG_MODULE_SIG_SHA512 \
-    -d CONFIG_MODULE_SIG_HASH \
-    -e MI_FRAGMENTION \
-    -e PERF_HELPER \
-    -e BOOTUP_RECLAIM \
-    -e MI_RECLAIM \
-    -e RTMM \
-
-# 打印实际生效的关键选项,免得"配了但没生效"这种事静默过去
-echo "===== 生效的关键选项 ====="
-grep -E '^CONFIG_(KSU|KPM|KSU_MANUAL_HOOK|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL)=' out/.config || true
-grep -E '^# CONFIG_(KSU_MANUAL_HOOK|KSU_DEBUG|KPROBES) is not set' out/.config || true
-echo "============================="
+apply_config
 
 # 整树编译前再确认一次 flask.h 在位。中间隔了一次 defconfig,若 .config 有任何
 # 变化导致 security/selinux 被重编,它的 flask.h 会跟着重新生成 —— 顺序上
