@@ -93,6 +93,69 @@ open(p, "w").write(src)
 print(f"[compat] 改写 {n} 处,残留 0 处,shim 已插入 {p}")
 PY
 
+# ---- 4.19 兼容:MODULE_IMPORT_NS 是 5.4+ 才有的宏 ----
+# v4.2.0 的 core/init.c 无条件调用它(两处,分别在 >=6.13 / #else 分支里)。
+# 4.19 的 include/linux/module.h 没有这个定义,预处理器把整个宏当普通标识符吞掉,
+# 剩下的 (name); 被 clang 解析成隐式 int 的函数定义,报 "type specifier missing"。
+#
+# 这里不定义空宏,而是直接把语句换成注释:4.19 压根没有模块命名空间机制,
+# 这个导入在 4.19 上本就是无意义的空操作,删掉语义正确。
+# 之所以不#define 成空:展开后是文件作用域的裸 ';',ISO C 不允许,
+# 而这棵树的诊断标签是 [-Werror,-Wimplicit-int],说明确实开了 -Werror,赌不起。
+KSU_INIT=KernelSU/kernel/core/init.c
+python3 - "$KSU_INIT" <<'PY'
+import re
+import sys
+
+p = sys.argv[1]
+src = open(p).read()
+
+MARK = "K4_19_NS_STRIP"
+if MARK in src:
+    print("[compat] MODULE_IMPORT_NS 已处理,跳过")
+    sys.exit(0)
+
+# 整行都是该宏的独立语句才算,避免误伤 include、条件编译里的其他引用
+PAT = re.compile(r"^[ \t]*MODULE_IMPORT_NS\(.*\);[ \t]*$", re.M)
+n = len(PAT.findall(src))
+if n == 0:
+    print("[compat] 上游已无独立的 MODULE_IMPORT_NS 语句,跳过")
+    sys.exit(0)
+
+src = PAT.sub(f"/* {MARK}: 4.19 无模块命名空间机制(5.4+ 才有),此导入无意义,已移除 */", src)
+
+# 替换后不能再有任何形式的调用残留
+left = src.count("MODULE_IMPORT_NS(")
+if left:
+    sys.exit(f"仍有 {left} 处 MODULE_IMPORT_NS( 残留(可能是非独立语句的用法,需人工处理),中止")
+if src.count(MARK) != n:
+    sys.exit(f"注释标记数 {src.count(MARK)} != 预期 {n},中止")
+
+open(p, "w").write(src)
+print(f"[compat] 已移除 {n} 处 MODULE_IMPORT_NS 导入 -> {p}")
+PY
+
+# ---- 预检:只编 KSU 目录 ----
+# 整棵树要 12 分钟才走到 drivers/kernelsu,4.19 兼容问题一个一个冒出来、一轮 12 分钟。
+# 这里先把 KSU 单独编出来,配合 -k 一次把剩下所有不兼容点全收齐,再决定要不要跑整树。
+echo "[preflight] 单独编译 drivers/kernelsu(配 -k 一次收全所有错误)..."
+make $MAKE_ARGS ${TARGET_DEVICE}_defconfig >/dev/null
+scripts/config --file out/.config -e KSU -e KPM
+rm -rf out/drivers/kernelsu out/arch/arm64/boot/dts 2>/dev/null || true
+if make $MAKE_ARGS -k drivers/kernelsu >/tmp/preflight.log 2>&1; then
+    echo "[preflight] ✅ KSU 目录编译通过"
+else
+    if grep -q "No rule to make target" /tmp/preflight.log; then
+        # 目标名在这个内核版本上不认,不是真错误,放行让整树编译去暴露问题
+        echo "[preflight] 目标名不适用于本内核,跳过预检(不影响后续整树编译)"
+    else
+        echo "[preflight] ❌ KSU 编译失败,错误清单:"
+        grep -E "error:|fatal error" /tmp/preflight.log | head -60
+        echo "[preflight] 完整日志 /tmp/preflight.log"
+        exit 1
+    fi
+fi
+
 # ---- AnyKernel3 打包用 ----
 git clone --depth=1 -b kona https://github.com/liyafe1997/AnyKernel3 anykernel
 
@@ -198,7 +261,18 @@ scripts/config --file out/.config \
     -e MI_RECLAIM \
     -e RTMM \
 
-make $MAKE_ARGS -j$(nproc)
+# -k:一次把剩下所有错误收齐,而不是撞上第一个就停。
+# 每轮整树编译 12 分钟,一轮只换一个错误太亏。
+set +e
+make $MAKE_ARGS -k -j$(nproc) 2>&1 | tee /tmp/build.log
+rc=${PIPESTATUS[0]}
+set -e
+if [ "$rc" -ne 0 ]; then
+    echo "===== 编译失败 (rc=${rc}),错误清单 ====="
+    grep -E "error:|fatal error" /tmp/build.log | head -80
+    echo "===== 完整日志 /tmp/build.log ====="
+    exit 1
+fi
 
 [ -f out/arch/arm64/boot/Image ] || { echo "编译失败:没有生成 Image"; exit 1; }
 echo "[build] Image 生成成功"
