@@ -145,30 +145,32 @@ scripts/config --file out/.config \
     -d KSU_ALLOWLIST_WORKAROUND \
     -d KSU_MULTI_MANAGER_SUPPORT
 
-# SUSFS 整组关掉,而且是【必须】关:KSU_SUSFS 的 Kconfig 默认值是 y,不显式关
-# 它就会按默认打开,而 SUSFS 依赖内核树侧的 fs/susfs.c(susfs4ksu 补丁),
-# 这棵树没有 —— 结果就是 core_hook.c 引用一批不存在的 CMD_SUSFS_* 标识符。
-# SUSFS 是内核树侧的东西(kernel/Makefile 里靠 test -e fs/susfs.c 探测),
-# 真要它得先按 gitlab.com/simonpunk/susfs4ksu 打补丁,那是另一件事。
+# SUSFS 整组必须关,而这组选项的默认值【几乎全是 y】,漏一条就翻车。
 #
-# 选项名对齐 329b7f59 的 kernel/Kconfig。该版本相对 1.5.7 删掉了已废弃的
-# KSU_SUSFS_SUS_OVERLAYFS,所以下面比 1.5.7 少一条 —— 别照抄旧列表,
-# scripts/config 遇到不存在的选项会写一行 "# CONFIG_X is not set",无害但误导人。
-scripts/config --file out/.config \
-    -d KSU_SUSFS \
-    -d KSU_SUSFS_HAS_MAGIC_MOUNT \
-    -d KSU_SUSFS_SUS_PATH \
-    -d KSU_SUSFS_SUS_MOUNT \
-    -d KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
-    -d KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
-    -d KSU_SUSFS_SUS_KSTAT \
-    -d KSU_SUSFS_TRY_UMOUNT \
-    -d KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
-    -d KSU_SUSFS_SPOOF_UNAME \
-    -d KSU_SUSFS_ENABLE_LOG \
-    -d KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-    -d KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-    -d KSU_SUSFS_OPEN_REDIRECT
+#   config KSU_SUSFS                  default y
+#   config KSU_SUSFS_SUS_SU           default y   ← 上一次就是死在这条上
+#
+# SUSFS 依赖内核树侧的 fs/susfs.c(susfs4ksu 补丁),这棵树没打,所以只要
+# CONFIG_KSU_SUSFS* 是 y,KSU 子树(core_hook.c 等)就会引用一批不存在的
+# CMD_SUSFS_* 标识符,直接编译失败。
+#
+# 选项名不再手写清单,直接从挂上来的 drivers/kernelsu/Kconfig 里提取全部
+# KSU_SUSFS* —— 手写清单已经栽过一次:329b7f59 的 Kconfig 有 15 个 SUSFS 选项,
+# 我抄的 14 个少一条 KSU_SUSFS_SUS_SU(它的 depends 里带 KPROBES && HAVE_KPROBES
+# && KPROBE_EVENTS,不在前 14 条的命名模式里,肉眼扫极易漏)。
+# 上游增删选项时这段不用跟着改,漏一条的后果是整轮 runner 白烧,值得多写这几行。
+SUSFS_OPTS=$(sed -n 's/^config \(KSU_SUSFS[A-Z_]*\)$/\1/p' drivers/kernelsu/Kconfig | sort -u)
+SUSFS_N=$(printf '%s\n' "$SUSFS_OPTS" | grep -c . || true)
+if [ "${SUSFS_N:-0}" -lt 1 ]; then
+    echo "❌ 从 drivers/kernelsu/Kconfig 里没提取到任何 KSU_SUSFS* 选项,Kconfig 结构变了?"
+    exit 1
+fi
+echo "[cfg] 关掉 ${SUSFS_N} 个 KSU_SUSFS* 选项:$(echo "$SUSFS_OPTS" | tr '\n' ' ')"
+susfs_args=()
+while IFS= read -r o; do
+    [ -n "$o" ] && susfs_args+=(-d "$o")
+done <<< "$SUSFS_OPTS"
+scripts/config --file out/.config "${susfs_args[@]}"
 
 # KPM 靠 select 拉进来的 KALLSYMS_ALL 会把全量符号名塞进 Image。
 # 这正好让 CI 的 strings 校验能真的查到 KernelSU 符号,而不是靠字符串残留蒙。
