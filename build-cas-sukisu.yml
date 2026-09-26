@@ -1,0 +1,141 @@
+name: Build cas SukiSU kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [cas-ksu-v4-kprobes]
+    paths:
+      - 'build_cas_sukisu.sh'
+      - 'build-cas-sukisu.yml'
+      - 'arch/arm64/configs/cas_defconfig'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    # 版本锁在脚本里(单一事实来源)。这里只做展示,方便在 Actions 页面一眼看到
+    # 这次到底编的是哪个 SukiSU —— 脚本已经 echo 过一遍,这里再固化进 job summary。
+    env:
+      SUKISU_REPO: https://github.com/liyafe1997/SukiSU-Ultra
+      SUKISU_REF: f4863b20cc8dc0f8cc67418980f022e43014b598
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu \
+            ccache zip unzip wget cpio bc bison flex make \
+            libssl-dev libncurses-dev python3 rsync
+
+      # 优先用 AOSP clang 17(与已验证的预编译包同一大版本)。
+      # 目录名/默认分支不写死,运行时从 gitiles 探测,避免写死路径导致 400/404。
+      - name: Install AOSP clang 17
+        id: clang_aosp
+        continue-on-error: true
+        run: |
+          set -e
+          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
+          REF=$(curl -fsS "$BASE/?format=JSON" | tail -n +2 \
+                | python3 -c "import sys,json;print(json.load(sys.stdin).get('defaultBranch','main'))")
+          echo "  仓库默认分支: $REF"
+          DIR=$(curl -fsS "$BASE/+/$REF?format=JSON" | tail -n +2 | python3 -c "
+          import sys, json, re
+          names = [e['name'] for e in json.load(sys.stdin).get('entries', [])]
+          c17 = [n for n in names if re.match(r'^clang-r5[01]', n) and re.fullmatch(r'clang-r5[01]\d*[a-z]?', n)]
+          c17.sort()
+          print(c17[-1] if c17 else '')
+          ")
+          [ -n "$DIR" ] || { echo "  未探测到 clang 目录"; exit 1; }
+          echo "  选用: $DIR"
+          mkdir -p /opt/aosp-clang
+          curl -fL --retry 2 --connect-timeout 30 "$BASE/+archive/refs/heads/$REF/$DIR.tar.gz" -o /tmp/clang.tar.gz
+          tar -xzf /tmp/clang.tar.gz -C /opt/aosp-clang
+          rm -f /tmp/clang.tar.gz
+          /opt/aosp-clang/bin/clang --version | tee /tmp/cv
+          grep -qE "clang version 1[6-9]|clang version 2[0-9]" /tmp/cv || { echo "  版本异常"; exit 1; }
+          echo "CLANG_BIN=/opt/aosp-clang/bin" >> "$GITHUB_ENV"
+
+      # 回退 1:apt 的 clang-17(与 AOSP clang 17.0.2 足够接近)
+      - name: Install clang-17 from apt
+        id: clang_apt17
+        if: always() && steps.clang_aosp.outcome != 'success'
+        continue-on-error: true
+        run: |
+          set -e
+          sudo apt-get install -y --no-install-recommends clang-17
+          clang-17 --version | head -1
+          echo "CLANG_BIN=/usr/lib/llvm-17/bin" >> "$GITHUB_ENV"
+
+      # 回退 2:默认 clang
+      - name: Install default clang
+        if: always() && steps.clang_aosp.outcome != 'success' && steps.clang_apt17.outcome != 'success'
+        run: |
+          set -e
+          sudo apt-get install -y --no-install-recommends clang
+          echo "CLANG_BIN=/usr/bin" >> "$GITHUB_ENV"
+
+      - name: Report toolchain
+        run: |
+          echo "SukiSU: ${SUKISU_REPO} @ ${SUKISU_REF}"
+          echo "CLANG_BIN=$CLANG_BIN"
+          $CLANG_BIN/clang --version
+          aarch64-linux-gnu-ld --version | head -1
+          arm-linux-gnueabi-ld --version | head -1
+          echo "--- clang 来源: AOSP=$( [ "$CLANG_BIN" = /opt/aosp-clang/bin ] && echo 是 || echo 否) ---"
+          df -h / | tail -1
+
+      - name: Build
+        run: bash build_cas_sukisu.sh
+
+      # 这些校验必须是硬失败。之前"Image 里 register_kprobe 命中数为 0"的情况
+      # 是在包已经发出去之后才发现的 —— 那种包刷进去 KSU 是挂不上的,
+      # 但构建本身一路绿灯,没有任何地方会叫停。
+      - name: Verify KSU landed in the Image
+        run: |
+          set -euo pipefail
+          IMG=dist/Image_cas_sukisu
+          test -f "$IMG" || { echo "❌ 没有产出 Image"; exit 1; }
+          ls -la dist/
+          echo "$SUKISU_REPO @ $SUKISU_REF" >> "$GITHUB_STEP_SUMMARY"
+
+          KSU_STR=$(strings -a "$IMG" | grep -c "KernelSU" || true)
+          echo "  KernelSU 字符串数: $KSU_STR"
+          if [ "${KSU_STR:-0}" -lt 10 ]; then
+            echo "  ❌ KernelSU 符号过少,KSU 很可能没真正编进去"
+            exit 1
+          fi
+
+          # 整词匹配:kernel_compat.c 里也有一堆 *_access_ok 之类的近似名字,
+          # 用子串匹配会得到假的正数。这里必须确认 kprobe 注册路径存在。
+          KPROBE=$(strings -a "$IMG" | grep -cxE "register_kprobe" || true)
+          echo "  register_kprobe(整词)命中: $KPROBE"
+          if [ "${KPROBE:-0}" -lt 1 ]; then
+            echo "  ❌ 没有 register_kprobe —— KSU_MANUAL_HOOK 是不是被误开了?"
+            echo "     开着它 KSU 走的是手动打补丁路径,和预期的 kprobe 路径不符。"
+            exit 1
+          fi
+
+          if strings -a "$IMG" | grep -q "KPROBES is disabled"; then
+            echo "  ❌ 内核仍带 KPROBES 告警 —— KSU 会失效"
+            exit 1
+          fi
+          echo "  ✅ 无 KPROBES 告警"
+
+          strings -a "$IMG" | grep -m1 "Linux version" || true
+          echo "✅ Image 校验通过"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cas-sukisu-kernel
+          path: |
+            dist/Image_cas_sukisu
+            dist/*.zip
+          retention-days: 30
