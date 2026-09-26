@@ -1,0 +1,103 @@
+name: Build cas SukiSU kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [cas-ksu-v4-kprobes]
+    paths:
+      - 'build_cas_sukisu.sh'
+      - 'arch/arm64/configs/cas_defconfig'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      SUKISU_TAG: v4.2.0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu \
+            ccache zip unzip wget cpio bc bison flex make \
+            libssl-dev libncurses-dev python3 rsync
+
+      - name: Install AOSP clang (与已验证发布版一致的 clang 17.0.2)
+        id: clang_aosp
+        continue-on-error: true
+        run: |
+          set -e
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz"
+          mkdir -p /opt/aosp-clang
+          echo "下载 AOSP clang r487747c ..."
+          curl -fL --retry 2 --connect-timeout 30 "$URL" -o /tmp/clang.tar.gz
+          tar -xzf /tmp/clang.tar.gz -C /opt/aosp-clang
+          rm -f /tmp/clang.tar.gz
+          if /opt/aosp-clang/bin/clang --version | grep -q "clang version 17"; then
+            echo "CLANG_BIN=/opt/aosp-clang/bin" >> "$GITHUB_ENV"
+            echo "AOSP clang 17 就绪"
+          else
+            echo "AOSP clang 版本不符"; exit 1
+          fi
+
+      - name: Install proton-clang 13 (回退方案)
+        id: clang_proton
+        if: steps.clang_aosp.outcome != 'success'
+        run: |
+          set -e
+          mkdir -p /opt/proton && cd /opt/proton
+          curl -fL --retry 2 --connect-timeout 30 \
+            "https://gitlab.com/proton-clang/proton-clang/-/releases/20210522/downloads/proton-clang-20210522.tar.gz" \
+            -o p.tar.gz
+          tar -xzf p.tar.gz && rm -f p.tar.gz
+          D=$(find /opt/proton -maxdepth 1 -type d -name 'proton-clang*' | head -1)
+          echo "CLANG_BIN=$D/bin" >> "$GITHUB_ENV"
+          $D/bin/clang --version | head -1
+
+      - name: Install distro clang (最终回退)
+        if: steps.clang_proton.outcome != 'success'
+        run: |
+          set -e
+          sudo apt-get install -y --no-install-recommends clang
+          echo "CLANG_BIN=/usr/bin" >> "$GITHUB_ENV"
+          clang --version | head -1
+
+      - name: Report toolchain
+        run: |
+          echo "CLANG_BIN=$CLANG_BIN"
+          $CLANG_BIN/clang --version
+          aarch64-linux-gnu-ld --version | head -1
+          arm-linux-gnueabi-ld --version | head -1
+          df -h / | tail -1
+
+      - name: Build
+        run: bash build_cas_sukisu.sh
+
+      - name: Verify KSU landed in the Image
+        run: |
+          set -e
+          IMG=dist/Image_cas_sukisu
+          test -f "$IMG" || { echo "没有产出 Image"; exit 1; }
+          echo "=== KSU 符号检查 ==="
+          strings -a "$IMG" | grep -c "KernelSU" | xargs echo "  KernelSU 字符串数:"
+          strings -a "$IMG" | grep -m1 "Linux version" || true
+          echo "=== kprobes 检查(非 0 才说明 KSU 能挂钩)==="
+          strings -a "$IMG" | grep -cE "^register_kprobe$" | xargs echo "  register_kprobe 命中:"
+          strings -a "$IMG" | grep -i "KPROBES is disabled" && echo "  ⚠️ 仍有 KPROBES 告警" || echo "  ✅ 无 KPROBES 告警"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cas-sukisu-kernel
+          path: |
+            dist/Image_cas_sukisu
+            dist/*.zip
+          retention-days: 30
