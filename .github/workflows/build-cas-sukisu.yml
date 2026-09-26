@@ -42,12 +42,12 @@ jobs:
                 | python3 -c "import sys,json;print(json.load(sys.stdin).get('defaultBranch','main'))")
           echo "  仓库默认分支: $REF"
           DIR=$(curl -fsS "$BASE/+/$REF?format=JSON" | tail -n +2 | python3 -c "
-import sys, json, re
-names = [e['name'] for e in json.load(sys.stdin).get('entries', [])]
-c17 = [n for n in names if re.match(r'^clang-r5[01]', n) and re.fullmatch(r'clang-r5[01]\d*[a-z]?', n)]
-c17.sort()
-print(c17[-1] if c17 else '')
-")
+          import sys, json, re
+          names = [e['name'] for e in json.load(sys.stdin).get('entries', [])]
+          c17 = [n for n in names if re.match(r'^clang-r5[01]', n) and re.fullmatch(r'clang-r5[01]\d*[a-z]?', n)]
+          c17.sort()
+          print(c17[-1] if c17 else '')
+          ")
           [ -n "$DIR" ] || { echo "  未探测到 clang 目录"; exit 1; }
           echo "  选用: $DIR"
           mkdir -p /opt/aosp-clang
