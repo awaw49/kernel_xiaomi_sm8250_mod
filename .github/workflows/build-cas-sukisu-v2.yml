@@ -13,11 +13,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 300
-    # 版本锁在脚本里(单一事实来源)。这里只做展示,方便在 Actions 页面一眼看到
-    # 这次到底编的是哪个 SukiSU —— 脚本已经 echo 过一遍,这里再固化进 job summary。
-    env:
-      SUKISU_REPO: https://github.com/liyafe1997/SukiSU-Ultra
-      SUKISU_REF: f4863b20cc8dc0f8cc67418980f022e43014b598
+    # 这里【故意不设】env: SUKISU_REF。
+    # job 级 env 会覆盖脚本里的 ${SUKISU_REF:-...},而脚本才是版本锁的地方。
+    # 之前这里钉的是 f4863b20、脚本里钉的是 329b7f59,env 优先级更高,于是
+    # 实际编的是 f4863b20,脚本却按 329b7f59 的默认值配置 Kconfig、
+    # 在 zip 文件名上印 329b7f59 —— 三处互相矛盾,且从产物上看不出来。
+    # "单一事实来源"只有在不存在更高优先级来源时才成立。
+    # 真实编到哪一版,以脚本 checkout 后核对出的 SHA 为准,见 dist/BUILD_INFO.txt。
 
     steps:
       - name: Checkout
@@ -83,7 +85,8 @@ jobs:
 
       - name: Report toolchain
         run: |
-          echo "SukiSU: ${SUKISU_REPO} @ ${SUKISU_REF}"
+          echo "SukiSU 版本锁在 build_cas_sukisu.sh(本 workflow 不设 env 以免覆盖它)"
+          grep -E '^SUKISU_(REPO|REF)=' build_cas_sukisu.sh || true
           echo "CLANG_BIN=$CLANG_BIN"
           $CLANG_BIN/clang --version
           aarch64-linux-gnu-ld --version | head -1
@@ -105,7 +108,11 @@ jobs:
           IMG=dist/Image_cas_sukisu
           test -f "$IMG" || { echo "❌ 没有产出 Image"; exit 1; }
           ls -la dist/
-          echo "$SUKISU_REPO @ $SUKISU_REF" >> "$GITHUB_STEP_SUMMARY"
+          # 构建凭据由脚本产出(它核对过实际 checkout 的 SHA),这里只读不推断。
+          # 自己 echo $SUKISU_REF 是推断不是事实 —— 那正是上次版本对不上的原因。
+          test -f dist/BUILD_INFO.txt || { echo "❌ 没有 dist/BUILD_INFO.txt"; exit 1; }
+          cat dist/BUILD_INFO.txt
+          cat dist/BUILD_INFO.txt >> "$GITHUB_STEP_SUMMARY"
 
           # 这里只用【字符串字面量】做判据,不去 strings 里找符号名。
           # arm64 的 kallsyms 符号名存在 kallsyms_names 里,是 deflate 压缩的,
@@ -140,4 +147,5 @@ jobs:
           path: |
             dist/Image_cas_sukisu
             dist/*.zip
+            dist/BUILD_INFO.txt
           retention-days: 30
