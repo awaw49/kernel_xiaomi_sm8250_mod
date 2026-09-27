@@ -105,10 +105,131 @@ if [ "${KSU_LABEL:0:8}" != "${KSU_ACTUAL_REF:0:8}" ]; then
     exit 1
 fi
 
+# ---- 打 4.19 兼容补丁 ----
+#
+# 329b7f59 的 kernel/core_hook.c 有一个真实缺陷,和 4.19 本身无关:
+#
+#   1227  #ifdef CONFIG_KSU_SUSFS
+#   1229      bool is_zygote_child = susfs_is_sid_equal(...);
+#   1230  #endif            ← 提前闭合
+#   1231      if (likely(is_zygote_child)) {      ← 使用跑到保护外面
+#   ...
+#   1270      }                ← 关闭 1231 那个 {
+#   1271  #endif            ← 配 1249 的
+#
+# SUSFS 开启时正好自洽(声明和使用都在同一个 #ifdef 里),所以上游从来
+# 没暴露。我们必须关 SUSFS(这棵树没打 susfs4ksu 补丁),于是:
+#   - 1229 的声明被预处理删掉,1231 却还在用它 → use of undeclared identifier
+#   - 1249..1271 整段被删,连 1270 那个闭合的 '}' 一起没了
+#     → 1231 的 '{' 永远闭合不上,后面每一个函数定义都被报成
+#       "function definition is not allowed here"
+#
+# 这就是"报错位置和错因位置差 230 行"的典型:真正的错因在 1230,
+# 而第一条 fatal 报在 1353。f4863b20 没这问题,因为它用一个 #ifdef
+# 把「声明 + if 整块」罩住了 —— 本 patch 就是把 329b7f59 改回那种写法。
+KSU_PATCH="${KSU_PATCH:-ksu-4.19-compat.patch}"
+if [ ! -f "$KSU_PATCH" ]; then
+    echo "❌ 找不到兼容补丁 $KSU_PATCH(应与本脚本同目录)"
+    exit 1
+fi
+echo "[patch] 校验 $KSU_PATCH 是否适用于 ${KSU_ACTUAL_REF:0:8} ..."
+if ! git -C KernelSU apply --check "$KSU_PATCH"; then
+    # 不猜"可能上游自己修了"就放行 —— 那样编出来的会是一个没打补丁的
+    # 内核,错误在几千行之外才爆出来,比现在停下难查得多。
+    echo "❌ 补丁不适用于当前 SukiSU(${KSU_ACTUAL_REF:0:8})"
+    echo "   要么上游已改这段(补丁作废,删掉即可),要么改动过大需要重做补丁。"
+    echo "   绝不在这里静默跳过 —— 上一次跳过就编出了一个刷不动的内核。"
+    exit 1
+fi
+git -C KernelSU apply "$KSU_PATCH"
+echo "[patch] ✅ 已应用"
+
+# ---- 大括号平衡自检 ----
+# patch 修的正是"条件编译块里花括号不配对",而这类错误的编译报错点
+# 和错因点能差几百行,光看编译日志极难定位。所以在编译【之前】就把它验掉,
+# 而不是花 25 分钟跑完整树编译再从报错里反推。
+#
+# 做法:模拟一次预处理(把 CONFIG_KSU_SUSFS 整组视为关掉 —— 正是我们的实际
+# 配置),逐文件数花括号是否配平。其它 #if 条件一律当开,近似足够:实测 15 个
+# 源文件里只有 core_hook.c 会被判出问题,其余全部配平,没有误报。
+#
+# 这个自检本身被反向验证过 —— 断言必须能真的抓到问题,否则只是安慰剂:
+#   未打 patch + SUSFS=开  → 配平(所以上游自己的 CI 永远发现不了这个 bug)
+#   未打 patch + SUSFS=关  → core_hook.c 净 +1  ← 正是我们这个 4.19 无 susfs 的场景
+#   打上 patch(两种模式)  → 配平
+check_brace_balance() {
+    python3 - <<'PY'
+import glob, re, sys
+bad = []
+files = sorted(glob.glob('KernelSU/kernel/**/*.c', recursive=True))
+
+def susfs_is_on():
+    """本自检模拟的是【SUSFS 整组关闭】——正是这棵树实际的配置。"""
+    return False
+
+def branch_val(kind, rest):
+    """在上面的模拟下,这个 #if 分支是否为真。"""
+    if kind == 'if':
+        return True                      # 其它条件一律当开,近似足够
+    hit = rest.startswith('CONFIG_KSU_SUSFS')
+    # 注意方向:SUSFS 关闭时,#ifdef CONFIG_KSU_SUSFS* 为【假】。
+    # 这里曾经写反成 `hit if kind == 'ifdef'`,于是整组被当成开启 ——
+    # 未打 patch 的 core_hook.c 反而报配平,断言彻底失效且不自知。
+    on = susfs_is_on()
+    return (hit if on else not hit) if kind == 'ifdef' else not (hit if on else not hit)
+
+for path in files:
+    out, stack = [], []
+    for raw in open(path, encoding='utf-8', errors='replace'):
+        s = raw.strip()
+        if s.startswith('//') or s.startswith('*'):
+            continue
+        m = re.match(r'#\s*(ifdef|ifndef|if|elif|else|endif)\b(.*)', s)
+        if m:
+            d, rest = m.group(1), m.group(2).strip()
+            # 栈帧 = (本分支条件是否为真, 外层上下文是否激活)。
+            # SUSFS 必须按【前缀】判定整组:C 预处理器只认"宏是否定义",
+            # 不认 Kconfig 里的 depends —— CONFIG_KSU_SUSFS_SUS_SU 这类子选项
+            # 在依赖不满足时同样不出现在 config.h 里,于是 #ifdef 一律为假。
+            # 早先写成精确匹配 'CONFIG_KSU_SUSFS',子选项全被当成开启,
+            # 原始文件和修复文件都报配平 —— 断言形同虚设。
+            if d in ('ifdef', 'ifndef', 'if'):
+                outer = all(t and o for t, o in stack)
+                stack.append((branch_val(d, rest), outer))
+            elif d in ('elif', 'else'):
+                if stack:
+                    t, o = stack[-1]
+                    stack[-1] = (not t, o)
+            elif d == 'endif':
+                if stack:
+                    stack.pop()
+            continue
+        # 上一版这里只看了栈帧的第二个元素,而 #else 只翻转第一个,
+        # 第二个从头到尾没变过 —— #else 之后的代码根本没被跳过,
+        # selinux.c 的 ksu_getenforce() 因此误报。判据必须是 t and o。
+        if all(t and o for t, o in stack):
+            out.append(raw)
+    depth = 0
+    for line in out:
+        code = re.sub(r'//.*', '', line)
+        code = re.sub(r'"(\\.|[^"\\])*"', '""', code)
+        depth += code.count('{') - code.count('}')
+    if depth != 0:
+        bad.append((path, depth))
+print(f"[brace] 模拟 SUSFS=关闭,检查 {len(files)} 个源文件的大括号配平 ...")
+for path, d in bad:
+    print(f"  ❌ {path}  净{d:+d} 个未闭合的 '{{'")
+if bad:
+    print("  这类错误的编译报错点会远在错因之后,别去编译日志里找 —— 先修条件编译块。")
+    sys.exit(1)
+print("  ✅ 全部配平")
+PY
+}
+check_brace_balance
+
 # 挂进 drivers/ —— 必须是相对 symlink,kbuild 才能找到源文件
 ln -sfn ../KernelSU/kernel drivers/kernelsu
 test -f drivers/kernelsu/Kconfig || { echo "错误:symlink 没挂上"; exit 1; }
-
 # 把 kernelsu 接进 drivers 的构建
 if ! grep -q 'drivers/kernelsu\|obj-\$(CONFIG_KSU) += kernelsu' drivers/Makefile; then
     printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
@@ -430,6 +551,8 @@ SukiSU 实际 : ${KSU_ACTUAL_REF}
 SukiSU 提交 : $(git -C KernelSU log -1 --format='%ad %s' --date=short)
 提交时间   : $(git -C KernelSU log -1 --format=%aI)
 文件名标签 : ${KSU_LABEL}
+兼容补丁   : ${KSU_PATCH}  ($(md5sum "$KSU_PATCH" | cut -d' ' -f1))
+SUSFS 配置 : 整组关闭(这棵树没有 susfs4ksu 内核侧补丁 fs/susfs.c)
 内核版本   : $(strings -a dist/Image_cas_sukisu | grep -m1 -o 'Linux version [^ ]*' || echo '(未取到)')
 Image 大小 : $(stat -c%s dist/Image_cas_sukisu) 字节
 Image md5  : $(md5sum dist/Image_cas_sukisu | cut -d' ' -f1)
