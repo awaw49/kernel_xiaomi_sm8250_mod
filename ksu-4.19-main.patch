@@ -155,7 +155,7 @@
 + * inode->security。infra/file_wrapper.c 用它拿 inode 的 SELinux sid。
 + */
 +#ifndef selinux_inode
-+#define selinux_inode(_inode) ((struct inode_security_struct *)(_inode)->security)
++#define selinux_inode(_inode) ((struct inode_security_struct *)(_inode)->i_security)
 +#endif
 +
 +#endif /* LINUX_VERSION_CODE < 5.8.0 */
@@ -291,7 +291,7 @@
  #include "klog.h" // IWYU pragma: keep
 --- a/kernel/selinux/rules.c
 +++ b/kernel/selinux/rules.c
-@@ -1,533 +1,541 @@
+@@ -1,533 +1,540 @@
 -#include "linux/rcupdate.h"
 -#include "security.h"
  #include <linux/uaccess.h>
@@ -315,13 +315,19 @@
 -
 +#include "avc.h"
 +
++/*
++ * 4.19:selinux_state 存在,但没有 policy 成员 —— policydb 是直接内嵌在
++ * struct selinux_ss 里的(配 rwlock,不是 5.x 的 mutex)。
++ * 下面 get_policydb() 走的就是这条 <5.10 的分支。
++ * 上游 898e9d4f 之后把这条分支删了,这里按 329b7f59 的形态接回来。
++ */
++#define KSU_COMPAT_USE_SELINUX_STATE
++
 +#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
  #define SELINUX_POLICY_INSTEAD_SELINUX_SS
 -
 +#endif
 +
-+#define KERNEL_SU_DOMAIN "su"
-+#define KERNEL_SU_FILE "ksu_file"
 +#define KERNEL_EXEC_TYPE "ksu_exec"
  #define ALL NULL
  
@@ -450,13 +456,6 @@
 +	ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
 +	ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
 +
-+#ifdef CONFIG_KSU_SUSFS
-+	// Allow umount in zygote process without installing zygisk
-+	ksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");
-+	susfs_set_init_sid();
-+	susfs_set_ksu_sid();
-+	susfs_set_zygote_sid();
-+#endif
 +
 +	mutex_unlock(&ksu_rules);
 +}
@@ -1039,7 +1038,7 @@
 -    kvfree(payload);
 -
 -    return ret;
-+	if (!arg4) {
++	if (!user_data) {
 +		return -1;
 +	}
 +
@@ -1052,7 +1051,7 @@
 +
 +	if (unlikely(ksu_is_compat)) {
 +		struct sepol_data_compat data_compat;
-+		if (copy_from_user(&data_compat, arg4, sizeof(struct sepol_data_compat))) {
++		if (copy_from_user(&data_compat, user_data, sizeof(struct sepol_data_compat))) {
 +			pr_err("sepol: copy sepol_data failed.\n");
 +			return -1;
 +		}
@@ -1068,7 +1067,7 @@
 +		subcmd = data_compat.subcmd;
 +	} else {
 +		struct sepol_data data;
-+		if (copy_from_user(&data, arg4, sizeof(struct sepol_data))) {
++		if (copy_from_user(&data, user_data, sizeof(struct sepol_data))) {
 +			pr_err("sepol: copy sepol_data failed.\n");
 +			return -1;
 +		}
@@ -1532,15 +1531,19 @@
      p->ops.fadvise = fp->f_op->fadvise ? ksu_wrapper_fadvise : NULL;
  
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-@@ -448,7 +456,12 @@
+@@ -448,7 +456,16 @@
      if (IS_ERR(inode))
          return inode;
      inode->i_flags &= ~S_PRIVATE;
 +#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
      error = security_inode_init_security_anon(inode, &qname, context_inode);
 +#else
-+    /* 4.19 的签名是 (inode, mode, qstr, cred),没有 anon 专用那一支。 */
-+    error = security_inode_init_security(inode, NULL, &qname, context_inode);
++    /* cas 这棵树没跟 5.2 的 _anon 分支,是 5 参的 vendor 老签名:
++     *   (inode, dir, qstr, initxattrs, fs_data)
++     * dir 传 context_inode、initxattrs 传 NULL,正好走
++     * `if (!initxattrs) return call_int_hook(inode_init_security, ...)`
++     * 那一支,语义与上游 _anon 一致。 */
++    error = security_inode_init_security(inode, context_inode, &qname, NULL, NULL);
 +#endif
      if (error) {
          iput(inode);
@@ -1561,8 +1564,7 @@
 -#include <linux/vmalloc.h>
  
  #include "sepolicy.h"
--#include "klog.h" // IWYU pragma: keep
-+#include "../klog.h" // IWYU pragma: keep
+ #include "klog.h" // IWYU pragma: keep
  #include "ss/symtab.h"
 +#include "../kernel_compat.h" // Add check Huawei Device
  
@@ -3484,3 +3486,80 @@
  
  // Operation on types
  bool ksu_type(struct policydb *db, const char *name, const char *attr);
+--- a/kernel/policy/allowlist.c
++++ b/kernel/policy/allowlist.c
+@@ -3,6 +3,7 @@
+ #include <linux/rculist.h>
+ #include <linux/mutex.h>
+ #include <linux/task_work.h>
++#include <linux/sched.h>
+ #include <linux/capability.h>
+ #include <linux/compiler.h>
+ #include <linux/fs.h>
+--- a/kernel/policy/app_profile.c
++++ b/kernel/policy/app_profile.c
+@@ -89,7 +89,9 @@
+ 
+     current->seccomp.mode = 0;
+     current->seccomp.filter = NULL;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+     atomic_set(&current->seccomp.filter_count, 0);
++#endif
+     spin_unlock_irq(&current->sighand->siglock);
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+--- a/kernel/manager/pkg_observer.c
++++ b/kernel/manager/pkg_observer.c
+@@ -4,6 +4,7 @@
+ #include <linux/namei.h>
+ #include <linux/fsnotify_backend.h>
+ #include <linux/slab.h>
++#include <linux/string.h>
+ #include <linux/rculist.h>
+ #include <linux/version.h>
+ #include "klog.h" // IWYU pragma: keep
+@@ -21,14 +22,22 @@
+ 
+ static struct fsnotify_group *g;
+ 
+-static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
+-                                  const struct qstr *file_name, u32 cookie)
++static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode, u32 mask,
++                            const void *data, int data_type,
++                            const unsigned char *file_name, u32 cookie,
++                            struct fsnotify_iter_info *iter_info)
+ {
++    size_t nlen;
++
++    (void)group; (void)inode; (void)data; (void)data_type; (void)cookie; (void)iter_info;
++
+     if (!file_name)
+         return 0;
+     if (mask & FS_ISDIR)
+         return 0;
+-    if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
++    /* 4.19 传的是裸文件名指针,不是 qstr,长度得自己算。 */
++    nlen = strlen((const char *)file_name);
++    if (nlen == 13 && !memcmp(file_name, "packages.list", 13)) {
+         pr_info("packages.list detected: %d\n", mask);
+         track_throne(false);
+     }
+@@ -36,7 +45,7 @@
+ }
+ 
+ static const struct fsnotify_ops ksu_ops = {
+-    .handle_inode_event = ksu_handle_inode_event,
++    .handle_event = ksu_handle_event,
+ };
+ 
+ static int add_mark_on_inode(struct inode *inode, u32 mask, struct fsnotify_mark **out)
+--- a/kernel/supercall/dispatch.c
++++ b/kernel/supercall/dispatch.c
+@@ -1,5 +1,7 @@
+ #include <linux/capability.h>
+ #include <linux/cred.h>
++#include <linux/sched/task.h>
++#include <linux/sched/signal.h>
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
+ #include <linux/uaccess.h>
