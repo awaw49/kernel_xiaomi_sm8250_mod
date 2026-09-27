@@ -160,14 +160,25 @@ apply_patch_file "$KSU_PATCH"   "KernelSU" "KSU侧" KSU_PATCH_ABS
 # 补丁生效的硬断言:内核树里不该再有任何指向已删除符号的引用。
 # 链接器当然也会报,但那时整树已经编了十几分钟;这里几秒钟就能拦下,
 # 而且报出来的信息直接指向是哪个文件哪一行。
-LEFT=$(grep -rln 'ksu_vfs_read_hook\|ksu_execveat_hook\|ksu_input_hook' \
+LEFT=$(grep -rln 'ksu_vfs_read_hook\|ksu_execveat_hook\|ksu_input_hook\|ksu_handle_faccessat\|ksu_handle_stat\|ksu_handle_devpts' \
         fs/ drivers/ arch/ include/ 2>/dev/null || true)
 if [ -n "$LEFT" ]; then
     echo "❌ 内核树里仍有已删除符号的引用:"
     echo "$LEFT"
     exit 1
 fi
-echo "[patch] ✅ 内核树已无 ksu_*_hook 残留引用"
+echo "[patch] ✅ 内核树已无 ksu_*_hook / ksu_handle_* 残留引用"
+
+# path_mount 出口:上游 KSU 的 su_mount_ns.c 要调它(MS_PRIVATE|MS_REC 把 root
+# 子树改 private),而 cas 这棵 Android 4.19 的 fs/namespace.c 里没有这个入口,
+# 能干活的 do_change_type() 是 static。内核侧补丁里补了一个薄封装,这里确认它
+# 真的补进去了 —— 缺了不会在这里报,要到链接 vmlinux 才炸,而那时整树已经
+# 编了二十多分钟。
+grep -q 'EXPORT_SYMBOL_GPL(path_mount);' fs/namespace.c || {
+    echo "❌ fs/namespace.c 里没有 path_mount 出口,内核侧补丁没生效"
+    exit 1
+}
+echo "[patch] ✅ fs/namespace.c 的 path_mount 出口就位"
 
 # ---- 大括号平衡自检 ----
 # 这类错误的编译报错点和错因点能差几百行,光看编译日志极难定位。

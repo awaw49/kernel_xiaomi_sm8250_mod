@@ -1,3 +1,19 @@
+  ✅ kernel/Kbuild  +7 -0
+  ✅ kernel/kernel_compat.h  +132 -2
+  ✅ kernel/kpm/kpm.c  +13 -13
+  ✅ kernel/core/init.c  +3 -5
+  ✅ kernel/feature/sucompat.c  +2 -1
+  ✅ kernel/infra/su_mount_ns.c  +2 -1
+  ✅ kernel/selinux/rules.c  +523 -510
+  ✅ kernel/feature/selinux_hide.c  +26 -19
+  ✅ kernel/infra/file_wrapper.c  +19 -0
+  ✅ kernel/selinux/sepolicy.c  +955 -860
+  ✅ kernel/selinux/sepolicy.h  +0 -2
+  ✅ kernel/policy/allowlist.c  +1 -0
+  ✅ kernel/policy/app_profile.c  +6 -0
+  ✅ kernel/manager/pkg_observer.c  +13 -4
+  ✅ kernel/supercall/dispatch.c  +2 -0
+  ✅ kernel/sulog/event.c  +1 -1
 --- a/kernel/Kbuild
 +++ b/kernel/Kbuild
 @@ -82,6 +82,10 @@
@@ -291,10 +307,12 @@
  #include "klog.h" // IWYU pragma: keep
 --- a/kernel/selinux/rules.c
 +++ b/kernel/selinux/rules.c
-@@ -1,533 +1,543 @@
+@@ -1,533 +1,546 @@
 -#include "linux/rcupdate.h"
 -#include "security.h"
  #include <linux/uaccess.h>
++#include <linux/sched.h>
++#include <linux/compat.h>
  #include <linux/types.h>
  #include <linux/version.h>
 -#include <linux/lockdep.h>
@@ -476,7 +494,8 @@
 +#define CMD_GENFSCON 9
 +
 +// keep it!
-+extern bool ksu_is_compat __read_mostly;
++/* 329 里这个定义在 kernel/ksud.c,main 已无该文件。 */
++static inline bool ksu_is_compat(void) { return is_32bit_task(current); }
 +
 +// armv7l kernel compat
 +#ifdef CONFIG_64BIT
@@ -1414,7 +1433,7 @@
  #endif
  
      context_write = &selinux_write_op[SEL_CONTEXT];
-@@ -506,11 +507,11 @@
+@@ -506,13 +507,18 @@
      }
      mutex_unlock(&selinux_hide_mutex);
      ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
@@ -1424,27 +1443,28 @@
          __free_page(fake_status);
      fake_status = NULL;
 -    mutex_unlock(&selinux_state.status_lock);
+-}
+-
 +    mutex_unlock(&selinux_state.ss->status_lock);
- }
- 
- void ksu_selinux_hide_drop_backup_if_unused()
-@@ -518,10 +519,15 @@
-     mutex_lock(&selinux_hide_mutex);
-     if (!ksu_selinux_hide_running && backup_sepolicy) {
-         pr_info("selinux_hide is not enabled - drop backup_sepolicy\n");
++}
++
 +#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-+        /* 5.x 上 backup_sepolicy 是自己深拷贝出来的一份,释放它是安全的。
-+         * 4.19 上它就是 selinux_state.ss 本体 —— 释放它等于释放正在使用的
-+         * SELinux 策略表,下一条 SELinux 检查就会踩已释放内存。整段不编。 */
-         sidtab_destroy(backup_sepolicy->sidtab);
-         kfree(backup_sepolicy->sidtab);
-         ksu_destroy_sepolicy(backup_sepolicy);
-         backup_sepolicy = NULL;
-+#endif
++/* 5.x 上 backup_sepolicy 是 ksu_dup_sepolicy() 深拷贝出来的一份,释放它安全。
++ * 4.19 上压根没有"备份策略"这个概念(fake_state 直接共享 selinux_state.ss),
++ * 没有副本可丢 —— 而且 backup_sepolicy 在我们这版 rules.c 里根本不存在,
++ * 连判空都是活引用。整函数不编。 */
+ void ksu_selinux_hide_drop_backup_if_unused()
+ {
+     mutex_lock(&selinux_hide_mutex);
+@@ -525,6 +531,7 @@
      }
      mutex_unlock(&selinux_hide_mutex);
  }
-@@ -605,7 +611,7 @@
++#endif
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+ /*
+@@ -605,7 +612,7 @@
      return rc;
  }
  
@@ -1453,7 +1473,7 @@
                                                 u32 *sid, u32 def_sid, gfp_t gfp_flags)
  {
      struct policydb *policydb;
-@@ -712,7 +718,7 @@
+@@ -712,7 +719,7 @@
      return rc;
  }
  
@@ -1462,7 +1482,7 @@
                                                 u32 *scontext_len)
  {
      struct policydb *policydb;
-@@ -744,7 +750,7 @@
+@@ -744,7 +751,7 @@
      return rc;
  }
  
@@ -1471,7 +1491,7 @@
  {
      avd->allowed = 0;
      avd->auditallow = 0;
-@@ -1085,7 +1091,7 @@
+@@ -1085,7 +1092,7 @@
      type_attribute_bounds_av(policydb, scontext, tcontext, tclass, avd);
  }
  
@@ -3513,6 +3533,18 @@
      spin_unlock_irq(&current->sighand->siglock);
  
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+@@ -100,7 +102,11 @@
+     fake->sighand = NULL;
+ #endif
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+     seccomp_filter_release(fake);
++#else
++    put_seccomp_filter(fake);
++#endif
+     kfree(fake);
+ }
+ 
 --- a/kernel/manager/pkg_observer.c
 +++ b/kernel/manager/pkg_observer.c
 @@ -4,6 +4,7 @@

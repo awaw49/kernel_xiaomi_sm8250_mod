@@ -82,15 +82,137 @@
  	if (is_event_supported(type, dev->evbit, EV_MAX)) {
  
  		spin_lock_irqsave(&dev->event_lock, flags);
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -450,16 +450,9 @@
+ 	return res;
+ }
+ 
+-#ifdef CONFIG_KSU
+-extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
+-			                    int *flags);
+-#endif
+ 
+ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+ {
+-#ifdef CONFIG_KSU
+-	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+-#endif
+ 	return do_faccessat(dfd, filename, mode);
+ }
+ 
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -371,9 +371,6 @@
+ 	return cp_new_stat(&stat, statbuf);
+ }
+ 
+-#ifdef CONFIG_KSU
+-extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+-#endif
+ 
+ #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
+ SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+@@ -382,9 +379,6 @@
+ 	struct kstat stat;
+ 	int error;
+ 
+-#ifdef CONFIG_KSU
+-	ksu_handle_stat(&dfd, &filename, &flag);
+-#endif
+ 	error = vfs_fstatat(dfd, filename, &stat, flag);
+ 	if (error)
+ 		return error;
+@@ -535,9 +529,6 @@
+ 	struct kstat stat;
+ 	int error;
+ 
+-#ifdef CONFIG_KSU
+-	ksu_handle_stat(&dfd, &filename, &flag); /* 32-bit su support */
+-#endif
+ 	error = vfs_fstatat(dfd, filename, &stat, flag);
+ 	if (error)
+ 		return error;
+--- a/drivers/tty/pty.c
++++ b/drivers/tty/pty.c
+@@ -711,18 +711,12 @@
+  *	This provides our locking for the tty pointer.
+  */
+ 
+-#ifdef CONFIG_KSU
+-extern int ksu_handle_devpts(struct inode*);
+-#endif
+ 
+ static struct tty_struct *pts_unix98_lookup(struct tty_driver *driver,
+ 		struct file *file, int idx)
+ {
+ 	struct tty_struct *tty;
+ 
+-#ifdef CONFIG_KSU
+-	ksu_handle_devpts((struct inode *)file->f_path.dentry->d_inode);
+-#endif
+ 	mutex_lock(&devpts_mutex);
+ 	tty = devpts_get_priv(file->f_path.dentry);
+ 	mutex_unlock(&devpts_mutex);
 --- a/kernel/kallsyms.c
 +++ b/kernel/kallsyms.c
-@@ -195,8 +195,9 @@
- 			return kallsyms_sym_address(i);
- 	}
- 	return module_kallsyms_lookup_name(name);
+@@ -767,3 +767,5 @@
+ 	return 0;
  }
+ device_initcall(kallsyms_init);
++
 +EXPORT_SYMBOL_GPL(kallsyms_lookup_name);
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -3838,6 +3838,51 @@
+ 	.owner		= mntns_owner,
+ };
  
- int kallsyms_on_each_symbol(int (*fn)(void *, const char *, struct module *,
- 				      unsigned long),
- 			    void *data)
++/*
++ * KSU 4.19 适配:补一个 path_mount() 出口。
++ *
++ * 上游 KSU(infra/su_mount_ns.c)在 unshare(CLONE_NEWNS) 之后调
++ *     path_mount(NULL, &root_path, NULL, MS_PRIVATE | MS_REC, NULL);
++ * 把 root 及其整棵子树的挂载传播属性改成 private —— 目的是让它随后建的
++ * 挂载不会传播回宿主 mount namespace。
++ *
++ * cas 这棵树是 Android 的 4.19:没有 path_mount 这个导出入口,真正干活的
++ * do_change_type() 是 static,drivers/kernelsu/ 够不着。这里补一个同语义的
++ * 薄封装,KSU 侧的代码一行不用改。
++ *
++ * 刻意只实现 type_page == NULL 那一支:带 type_page 的真挂载要走 do_mount(),
++ * 它带着 security_sb_mount() 的 LSM 检查和各标志位拆分,不在这里重造一个
++ * 绕过 LSM 的版本。需要真挂载的调用点请直接用 ksys_mount()。
++ */
++int path_mount(const char *dev_name, struct path *path,
++	       const char *type_page, unsigned long flags, void *data_page)
++{
++	int err;
++
++	if (type_page)
++		return -EINVAL;
++	if (!(flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE)))
++		return -EINVAL;
++
++	/* 和 do_mount() 走同一套 LSM/权限前置检查,顺序也照抄,
++	 * 否则这里就成了绕过 security_sb_mount() 的后门。
++	 * KSU 传进来的 dev_name / data 本来就是 NULL,
++	 * 和上游 path_mount() 走 do_mount() 时收到的是同一组 NULL。 */
++	err = security_sb_mount(dev_name, path, type_page, flags, data_page);
++	if (err)
++		return err;
++	if (!may_mount())
++		return -EPERM;
++	if (flags & SB_MANDLOCK) {
++		err = may_mandlock();
++		if (err)
++			return err;
++	}
++
++	return do_change_type(path, flags);
++}
++EXPORT_SYMBOL_GPL(path_mount);
++
+ #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+ extern void susfs_try_umount_all(uid_t uid);
+ void susfs_run_try_umount_for_current_mnt_ns(void) {
