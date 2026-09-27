@@ -495,7 +495,7 @@
 +
 +// keep it!
 +/* 329 里这个定义在 kernel/ksud.c,main 已无该文件。 */
-+static inline bool ksu_is_compat(void) { return is_32bit_task(current); }
++static inline bool ksu_is_compat(void) { return in_compat_syscall(); }
 +
 +// armv7l kernel compat
 +#ifdef CONFIG_64BIT
