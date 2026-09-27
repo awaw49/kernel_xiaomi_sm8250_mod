@@ -14,11 +14,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 300
-    # 版本锁在脚本里(单一事实来源)。这里只做展示,方便在 Actions 页面一眼看到
-    # 这次到底编的是哪个 SukiSU —— 脚本已经 echo 过一遍,这里再固化进 job summary。
-    env:
-      SUKISU_REPO: https://github.com/liyafe1997/SukiSU-Ultra
-      SUKISU_REF: f4863b20cc8dc0f8cc67418980f022e43014b598
+    # 【故意不设 env: SUKISU_REF】
+    #
+    # job 级 env 的优先级高于脚本里的 ${SUKISU_REF:-...}。这里曾经钉着
+    # f4863b20 —— 也就是原作者那一版,和脚本里钉的 329b7f59 不是同一版。
+    # 结果脚本按 329b7f59 配置 Kconfig、在 zip 文件名上印 329b7f59,
+    # 实际编出来的却是 f4863b20,而从产物上完全看不出来。
+    # "单一事实来源"只有在不存在更高优先级来源时才成立。
+    #
+    # 真正编到哪一版,以脚本 checkout 后核对出的 SHA 为准,见 dist/BUILD_INFO.txt。
+    # 脚本里另有两道断言:实际 SHA 对不上、或文件名标签与实际 SHA 不符,都会直接终止。
 
     steps:
       - name: Checkout
