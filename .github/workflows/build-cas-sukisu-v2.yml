@@ -6,7 +6,8 @@ on:
     branches: [cas-ksu-v4-kprobes]
     paths:
       - 'build_cas_sukisu.sh'
-      - 'build-cas-sukisu.yml'
+      - '.github/workflows/build-cas-sukisu-v2.yml'
+      - 'ksu-4.19-compat.patch'
       - 'arch/arm64/configs/cas_defconfig'
 
 jobs:
