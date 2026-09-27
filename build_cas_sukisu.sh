@@ -1,34 +1,25 @@
 #!/bin/bash
 # CI 构建:cas (小米10至尊纪念版/apollo) + MIUI 14 + SukiSU
 #
-# ---- 为什么锁在这个 commit(2026-09 复核过一遍,别随手换成 main)----
+# ---- 版本锁:yspbwx2010/SukiSU-Ultra 真上游 main(2026-09-27 重订)----
 #
-# 仓库有九条分支,但只有三条线的 kernel/selinux/sepolicy.c 带 <5.7.0 回退分支,
-# 也就是只有它们还能编 4.19。逐个实测的结果:
+# 之前锁的是 liyafe1997/SukiSU-Ultra —— 那是 yspbwx2010 的【个人 fork】,
+# 停在 2025-07-15,比真上游落后整整 13 个月。后果不是"版本旧一点",而是直接废机:
+# 内核里的 manager 签名表还是 2025-07 那版,而手机上装的是 2026 年的 SukiSU
+# 管理器 —— 包名对不上、APK 签名 sha256 也对不上,于是
+# 【管理器认不出内核】+【不给 root】,两个症状一个原因。
+# 所以这里锁的必须是 yspbwx2010 本家,不是任何人的 fork。
 #
-#   main / dev / new-wx / releases   2025-09-05  sepolicy.c 853 行  3 项 Kconfig
-#       历史上 2025-03-22 做过 "rewrite the update history",和下面三条【没有
-#       共同祖先】。sepolicy.c 里的 <5.7.0 回退分支被整段删掉,
-#       struct filename_trans_key 变成无条件使用 —— 而 4.19 的
-#       security/selinux/ss/policydb.h 里根本没有这个类型(5.7 才引入),
-#       4.19 上只有 struct filename_trans(u32 stype/ttype + u16 tclass),
-#       用 ebitmap filename_trans_ttypes 表达源类型集合,也没有
-#       compat_filename_trans_count,filename_trans_datum 里也没有 next 指针。
-#       => 编不过,和隐藏不隐藏 SELinux 无关。
+# 197cad88 (2026-08-15) 的 kernel/ 相比 329b7f59 变化很大:
+#   - 目录从扁平 15 个 .c 拆成 core/ feature/ hook/ infra/ kpm/ manager/
+#     policy/ runtime/ selinux/ sulog/ supercall/ 十一层
+#   - 挂钩换成 kprobes + 直接改写 sys_call_table,不再依赖内核树里预埋的
+#     ksu_vfs_read_hook / ksu_execveat_hook / ksu_input_hook
+#   - Kconfig 整组重写:没有 SUSFS、没有 KSU_MANUAL_HOOK,
+#     新增 KSU_MANUAL_SU / KPM / KSU_DISABLE_MANAGER / KSU_DISABLE_POLICY
+#   - config KSU depends on KPROBES && EXT4_FS,这棵树两个都是 y
 #
-#   nongki                          2025-07-09  sepolicy.c 1070 行  7 项 Kconfig
-#       4.19 能编,但 Kconfig 是 KSU_LSM_SECURITY_HOOKS(把钩子挂 LSM framework),
-#       没有 KSU_MANUAL_HOOK。这台机器不合适:小米把手动挂钩调用点直接焊进了
-#       内核源码(fs/read_write.c:598、fs/exec.c:1954/1987、drivers/input/input.c:458),
-#       而这三个全局变量只在 KSU 的非 kprobes 分支里定义,走 LSM 路径就接不上,
-#       链接 vmlinux 时三个 undefined reference。
-#
-#   susfs-1.5.7                     2025-07-09  sepolicy.c 1070 行 23 项 Kconfig
-#   susfs-main / susfs-test         2025-07-15  sepolicy.c 1070 行 22 项 Kconfig  <= 用这个
-#       两条线的 kernel/selinux/{sepolicy.c,rules.c} 内容【完全相同】(md5 一致),
-#       所以 4.19 兼容性一样;susfs-main 只是多 34 个 commit(动态签名、
-#       CMD_HOOK_TYPE/stat 钩子、多管理器),并且去掉了已废弃的
-#       KSU_SUSFS_SUS_OVERLAYFS。同为 4.19 可用,susfs-main 更新,故取它。
+# 4.19 上要补的洞一共四处,分别写在下面两个 patch 里,每处都注明了为什么。
 set -euo pipefail
 
 # 本脚本有多处 GNU 风格 `sed -i 's/../g' file`。macOS 的 BSD sed 语法不同,
@@ -50,15 +41,15 @@ GIT_COMMIT_ID=$(git rev-parse --short=8 HEAD)
 # f4863b20,而 zip 文件名里还印着 329b7f59 —— 三处自相矛盾,而且从产物
 # 上完全看不出来。"单一事实来源"这句话,只有在没有更高优先级的来源时
 # 才成立。yml 里已删掉这个 env。
-SUKISU_REPO="${SUKISU_REPO:-https://github.com/liyafe1997/SukiSU-Ultra}"
-SUKISU_REF="${SUKISU_REF:-329b7f59dc84d79ac27a3487cf21d90c01cdf656}"
+SUKISU_REPO="${SUKISU_REPO:-https://github.com/yspbwx2010/SukiSU-Ultra}"
+SUKISU_REF="${SUKISU_REF:-197cad8838da8d6cdf80356678e6100ce5e27a41}"
 KSU_EXPECTED_REF="$SUKISU_REF"
 
 # 打在 zip 文件名里的标签 —— 从 REF 派生,不硬编码。
 # 之前这里写死 "329b7f59-4.19-nongki",而 REF 可能被 yml 的 env 改掉,
 # 结果文件名里的版本号和实际编的东西无关,这正是"声称 v4.2.0 内容却是另一
 # 回事"那类错误的来源。派生之后两者永远一致:想换版本只改上面一行。
-KSU_LABEL="${KSU_LABEL:-${SUKISU_REF:0:8}-4.19-nongki}"
+KSU_LABEL="${KSU_LABEL:-${SUKISU_REF:0:8}-4.19-kprobes}"
 
 # ---- 工具链:CI 里用 clang + 交叉 binutils ----
 if [ -z "${CLANG_BIN:-}" ]; then
@@ -84,7 +75,12 @@ CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
 # 后面照样接着跑,最后产出一个没有 KSU 的内核。
 echo "[SukiSU] clone ${SUKISU_REPO} @ ${SUKISU_REF}"
 rm -rf KernelSU
-git clone --filter=blob:none "${SUKISU_REPO}" KernelSU
+# 必须完整 clone,不能用 --filter=blob:none / --depth。
+# kernel/Kbuild 用 `git rev-list --count main` 算 KSU_VERSION
+# (KSU_VERSION = 40000 + commit数 - 2815),浅克隆里没有 main 这个 ref,
+# rev-list 失败 → KSU_VERSION 掉回兜底值 13000,管理器里显示成一个 ancient 版本。
+# 这个数是内核对外报的版本号,不是装饰,算错就等于交了一份对不上的货。
+git clone "${SUKISU_REPO}" KernelSU
 git -C KernelSU checkout --detach "${SUKISU_REF}"
 
 # checkout 之后核对真实 SHA —— 这才是"编的到底是哪一版"的唯一可信凭据。
@@ -105,116 +101,150 @@ if [ "${KSU_LABEL:0:8}" != "${KSU_ACTUAL_REF:0:8}" ]; then
     exit 1
 fi
 
-# ---- 打 4.19 兼容补丁 ----
+# ---- 打 4.19 兼容补丁(两个,分属两棵树) ----
 #
-# 329b7f59 的 kernel/core_hook.c 有一个真实缺陷,和 4.19 本身无关:
+# 329b7f59 时代只有一个 ksu-4.19-compat.patch,改的是 KSU 自己的 core_hook.c。
+# 197cad88 换了挂钩机制之后,缺口换了一整类,得两个 patch 分头补:
 #
-#   1227  #ifdef CONFIG_KSU_SUSFS
-#   1229      bool is_zygote_child = susfs_is_sid_equal(...);
-#   1230  #endif            ← 提前闭合
-#   1231      if (likely(is_zygote_child)) {      ← 使用跑到保护外面
-#   ...
-#   1270      }                ← 关闭 1231 那个 {
-#   1271  #endif            ← 配 1249 的
+# [A] ksu-4.19-kprobes.patch —— 打在内核树(仓库根)上,两处:
+#   (1) 摘掉 fs/read_write.c、fs/exec.c、drivers/input/input.c 里那三处
+#       #ifdef CONFIG_KSU 的预埋调用点。
+#       这棵树出厂时把 KSU 的【手动挂钩】焊进了内核源码,但上游 main 已经
+#       删掉了对应的全局变量(ksu_vfs_read_hook / ksu_execveat_hook /
+#       ksu_input_hook —— 在 197cad88 的 kernel/ 里 grep 全是 0 命中)。
+#       CONFIG_KSU 一开,调用点就激活而变量无人定义,链接 vmlinux 直接
+#       undefined reference。main 走的是 kprobes + 改 sys_call_table,
+#       不需要这些调用点,所以正确做法是摘掉,不是补定义。
+#   (2) kernel/kallsyms.c 末尾补一行 EXPORT_SYMBOL_GPL(kallsyms_lookup_name)。
+#       4.19 里这个函数【存在但不导出】(实测 kernel/kallsyms.c 只有
+#       sprint_symbol / sprint_symbol_no_offset 两个 EXPORT)。
+#       main 的 infra/symbol_resolver.c 直接调它来定位 sys_call_table,
+#       不导出就是链接失败。这是 4.19 移植绕不开的一刀,社区各 LKM 也都这么补。
 #
-# SUSFS 开启时正好自洽(声明和使用都在同一个 #ifdef 里),所以上游从来
-# 没暴露。我们必须关 SUSFS(这棵树没打 susfs4ksu 补丁),于是:
-#   - 1229 的声明被预处理删掉,1231 却还在用它 → use of undeclared identifier
-#   - 1249..1271 整段被删,连 1270 那个闭合的 '}' 一起没了
-#     → 1231 的 '{' 永远闭合不上,后面每一个函数定义都被报成
-#       "function definition is not allowed here"
-#
-# 这就是"报错位置和错因位置差 230 行"的典型:真正的错因在 1230,
-# 而第一条 fatal 报在 1353。f4863b20 没这问题,因为它用一个 #ifdef
-# 把「声明 + if 整块」罩住了 —— 本 patch 就是把 329b7f59 改回那种写法。
-KSU_PATCH="${KSU_PATCH:-ksu-4.19-compat.patch}"
-# 必须转成绝对路径再往下走。`git -C KernelSU apply` 会让 git 按 KernelSU/
-# 解析相对路径,而补丁在仓库根目录 —— 于是上面 `[ -f "$KSU_PATCH" ]` 按脚本
-# cwd 检查说"在",git 紧接着却报 can't open patch。这个坑栽过一次。
-case "$KSU_PATCH" in
-    /*) ;;
-    *)  KSU_PATCH="$PWD/$KSU_PATCH" ;;
-esac
-if [ ! -f "$KSU_PATCH" ]; then
-    echo "❌ 找不到兼容补丁 $KSU_PATCH(应与本脚本同目录)"
+# [B] ksu-4.19-main.patch —— 打在 KernelSU 上,两处:
+#   (1) include/ksu.h 补 copy_{from,to}_user_nofault 垫片(5.8 才有的 API)。
+#   (2) Kbuild 给 KSU 子树加 -Wno-error(cas_defconfig 里 CONFIG_CC_WERROR=y)。
+apply_patch_file() {
+    local patch="$1" dir="$2" what="$3"
+    # 回填绝对路径,BUILD_INFO 后面要再取一次 md5
+    # 必须转成绝对路径。`git -C <dir> apply` 会让 git 按 <dir>/ 解析相对路径,
+    # 而补丁文件在仓库根 —— 于是 `[ -f "$patch" ]` 按脚本 cwd 检查说"在",
+    # git 紧接着却报 can't open patch。这个坑栽过一次。
+    case "$patch" in
+        /*) ;;
+        *)  patch="$PWD/$patch" ;;
+    esac
+    if [ ! -f "$patch" ]; then
+        echo "❌ 找不到 $what 补丁 $patch(应与本脚本同目录)"
+        exit 1
+    fi
+    echo "[patch:$what] 校验 $patch ..."
+    if ! git -C "$dir" apply --check "$patch"; then
+        # 不猜"可能上游自己修了"就放行 —— 那样编出来的会是一个没打补丁的
+        # 内核,错误在几千行之外才爆出来,比现在停下难查得多。
+        echo "❌ $what 补丁不适用于当前代码"
+        echo "   要么上游已改这段(补丁作废,删掉即可),要么改动过大需要重做补丁。"
+        echo "   绝不在这里静默跳过。"
+        exit 1
+    fi
+    git -C "$dir" apply "$patch"
+    echo "[patch:$what] ✅ 已应用  ($(md5sum "$patch" | cut -d' ' -f1))"
+    printf -v "${4}" '%s' "$patch"
+}
+
+KSU_PATCH="${KSU_PATCH:-ksu-4.19-main.patch}"
+KERNEL_PATCH="${KERNEL_PATCH:-ksu-4.19-kprobes.patch}"
+apply_patch_file "$KERNEL_PATCH" "." "内核侧" KERNEL_PATCH_ABS
+apply_patch_file "$KSU_PATCH"   "KernelSU" "KSU侧" KSU_PATCH_ABS
+
+# 补丁生效的硬断言:内核树里不该再有任何指向已删除符号的引用。
+# 链接器当然也会报,但那时整树已经编了十几分钟;这里几秒钟就能拦下,
+# 而且报出来的信息直接指向是哪个文件哪一行。
+LEFT=$(grep -rln 'ksu_vfs_read_hook\|ksu_execveat_hook\|ksu_input_hook' \
+        fs/ drivers/ arch/ include/ 2>/dev/null || true)
+if [ -n "$LEFT" ]; then
+    echo "❌ 内核树里仍有已删除符号的引用:"
+    echo "$LEFT"
     exit 1
 fi
-echo "[patch] 校验 $KSU_PATCH 是否适用于 ${KSU_ACTUAL_REF:0:8} ..."
-if ! git -C KernelSU apply --check "$KSU_PATCH"; then
-    # 不猜"可能上游自己修了"就放行 —— 那样编出来的会是一个没打补丁的
-    # 内核,错误在几千行之外才爆出来,比现在停下难查得多。
-    echo "❌ 补丁不适用于当前 SukiSU(${KSU_ACTUAL_REF:0:8})"
-    echo "   要么上游已改这段(补丁作废,删掉即可),要么改动过大需要重做补丁。"
-    echo "   绝不在这里静默跳过 —— 上一次跳过就编出了一个刷不动的内核。"
-    exit 1
-fi
-git -C KernelSU apply "$KSU_PATCH"
-echo "[patch] ✅ 已应用"
+echo "[patch] ✅ 内核树已无 ksu_*_hook 残留引用"
 
 # ---- 大括号平衡自检 ----
-# patch 修的正是"条件编译块里花括号不配对",而这类错误的编译报错点
-# 和错因点能差几百行,光看编译日志极难定位。所以在编译【之前】就把它验掉,
-# 而不是花 25 分钟跑完整树编译再从报错里反推。
+# 这类错误的编译报错点和错因点能差几百行,光看编译日志极难定位。
+# 所以在编译【之前】就把它验掉,而不是花二十几分钟跑完整树再从报错里反推。
 #
-# 做法:模拟一次预处理(把 CONFIG_KSU_SUSFS 整组视为关掉 —— 正是我们的实际
-# 配置),逐文件数花括号是否配平。其它 #if 条件一律当开,近似足够:实测 15 个
-# 源文件里只有 core_hook.c 会被判出问题,其余全部配平,没有误报。
+# 做法:按我们【实际生效的配置】模拟一次预处理,逐文件数花括号是否配平。
+# 197cad88 的 Kconfig 一共只有 7 个选项,取值全部已知(main 已经没有 SUSFS):
+#   KSU=y  KSU_DEBUG=n  KSU_MANUAL_SU=y  KPM=y
+#   KSU_DISABLE_MANAGER=n  KSU_DISABLE_POLICY=n  KSU_X86_PATCH_...=n
+# 未知的一律当"开"—— 这是保守方向:多算几行代码,宁可误报也不漏报。
+#
+# 关键点:C 预处理器只认"宏是否【定义】",不认 Kconfig 里的 depends。
+# 所以 CONFIG_KSU_DISABLE_MANAGER 在关掉时同样不出现在 config.h 里,
+# #ifdef 一律为假 —— 这里必须逐个选项查表,不能靠"整组前缀"。
 #
 # 这个自检本身被反向验证过 —— 断言必须能真的抓到问题,否则只是安慰剂:
-#   未打 patch + SUSFS=开  → 配平(所以上游自己的 CI 永远发现不了这个 bug)
-#   未打 patch + SUSFS=关  → core_hook.c 净 +1  ← 正是我们这个 4.19 无 susfs 的场景
-#   打上 patch(两种模式)  → 配平
+#   拿 329b7f59 那份有 bug 的 core_hook.c 反向灌进来,必须报出净 +1。
 check_brace_balance() {
     python3 - <<'PY'
 import glob, re, sys
-bad = []
-files = sorted(glob.glob('KernelSU/kernel/**/*.c', recursive=True))
 
-def susfs_is_on():
-    """本自检模拟的是【SUSFS 整组关闭】——正是这棵树实际的配置。"""
-    return False
+# 与 build_cas_sukisu.sh 的 scripts/config 调用保持一致
+OPTS = {
+    "CONFIG_KSU":                            True,
+    "CONFIG_KSU_DEBUG":                      False,
+    "CONFIG_KSU_MANUAL_SU":                  True,
+    "CONFIG_KPM":                            True,
+    "CONFIG_KSU_DISABLE_MANAGER":            False,
+    "CONFIG_KSU_DISABLE_POLICY":             False,
+    "CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER": False,
+}
+
+def macro_defined(rest):
+    """rest 形如 'CONFIG_KSU_DEBUG' 或 'defined(CONFIG_KSU) && FOO'。
+    取其中所有 CONFIG_KSU* / CONFIG_KPM 项,全部已定义才算真;
+    没提到的宏(KPROBES 之类)一律当已定义。"""
+    names = re.findall(r'\b(CONFIG_[A-Z0-9_]+|KPM)\b', rest)
+    for n in names:
+        if n in OPTS and not OPTS[n]:
+            return False
+    return True
 
 def branch_val(kind, rest):
-    """在上面的模拟下,这个 #if 分支是否为真。"""
     if kind == 'if':
-        return True                      # 其它条件一律当开,近似足够
-    hit = rest.startswith('CONFIG_KSU_SUSFS')
-    # 注意方向:SUSFS 关闭时,#ifdef CONFIG_KSU_SUSFS* 为【假】。
-    # 这里曾经写反成 `hit if kind == 'ifdef'`,于是整组被当成开启 ——
-    # 未打 patch 的 core_hook.c 反而报配平,断言彻底失效且不自知。
-    on = susfs_is_on()
-    return (hit if on else not hit) if kind == 'ifdef' else not (hit if on else not hit)
+        return macro_defined(rest)
+    if kind == 'ifdef':
+        return macro_defined(rest)
+    return not macro_defined(rest)      # ifndef
+
+bad = []
+files = sorted(glob.glob('KernelSU/kernel/**/*.c', recursive=True))
+if not files:
+    sys.exit("❌ 一个 KernelSU/kernel/*.c 都没找到 —— 挂载或路径出了问题")
 
 for path in files:
     out, stack = [], []
     for raw in open(path, encoding='utf-8', errors='replace'):
-        s = raw.strip()
-        if s.startswith('//') or s.startswith('*'):
+        t = raw.strip()
+        if t.startswith('//') or t.startswith('*'):
             continue
-        m = re.match(r'#\s*(ifdef|ifndef|if|elif|else|endif)\b(.*)', s)
+        m = re.match(r'#\s*(ifdef|ifndef|if|elif|else|endif)\b(.*)', t)
         if m:
             d, rest = m.group(1), m.group(2).strip()
             # 栈帧 = (本分支条件是否为真, 外层上下文是否激活)。
-            # SUSFS 必须按【前缀】判定整组:C 预处理器只认"宏是否定义",
-            # 不认 Kconfig 里的 depends —— CONFIG_KSU_SUSFS_SUS_SU 这类子选项
-            # 在依赖不满足时同样不出现在 config.h 里,于是 #ifdef 一律为假。
-            # 早先写成精确匹配 'CONFIG_KSU_SUSFS',子选项全被当成开启,
-            # 原始文件和修复文件都报配平 —— 断言形同虚设。
+            # 判据必须是 t and o —— 早先只看了第二项,而 #else 只翻转第一项,
+            # 第二项从头到尾没变,#else 之后的代码根本没被跳过。
             if d in ('ifdef', 'ifndef', 'if'):
-                outer = all(t and o for t, o in stack)
+                outer = all(t0 and o0 for t0, o0 in stack)
                 stack.append((branch_val(d, rest), outer))
             elif d in ('elif', 'else'):
                 if stack:
-                    t, o = stack[-1]
-                    stack[-1] = (not t, o)
+                    t0, o0 = stack[-1]
+                    stack[-1] = (not t0, o0)
             elif d == 'endif':
-                if stack:
-                    stack.pop()
+                if stack: stack.pop()
             continue
-        # 上一版这里只看了栈帧的第二个元素,而 #else 只翻转第一个,
-        # 第二个从头到尾没变过 —— #else 之后的代码根本没被跳过,
-        # selinux.c 的 ksu_getenforce() 因此误报。判据必须是 t and o。
-        if all(t and o for t, o in stack):
+        if all(t0 and o0 for t0, o0 in stack):
             out.append(raw)
     depth = 0
     for line in out:
@@ -223,7 +253,8 @@ for path in files:
         depth += code.count('{') - code.count('}')
     if depth != 0:
         bad.append((path, depth))
-print(f"[brace] 模拟 SUSFS=关闭,检查 {len(files)} 个源文件的大括号配平 ...")
+
+print(f"[brace] 按本脚本实际配置模拟预处理,检查 {len(files)} 个源文件的大括号配平 ...")
 for path, d in bad:
     print(f"  ❌ {path}  净{d:+d} 个未闭合的 '{{'")
 if bad:
@@ -247,14 +278,6 @@ if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
     echo "[SukiSU] drivers/Kconfig 已加 source"
 fi
 
-# 4.19 这棵树告警致命(诊断标签是 [-Werror,-Wimplicit-int]),而 CI 用的是
-# clang 17、上游当年是 proton-clang 12 —— 新版 clang 对同一份代码吐的新告警
-# 会直接顶死构建,而那些告警无一影响 KSU 功能。给 KSU 子目录单独关掉 -Werror。
-# 追加在文件末尾:上游 Makefile 结尾有 "Keep a new line here!!" 的显式邀请。
-if ! grep -q 'KSU_NO_WERROR_MARK' drivers/kernelsu/Makefile; then
-    printf '\n# KSU_NO_WERROR_MARK: 4.19 + clang17 的新告警不应杀死 KSU 子树\nccflags-y += -Wno-error\n' >> drivers/kernelsu/Makefile
-    echo "[SukiSU] 已给 KSU 子目录加 -Wno-error"
-fi
 
 # ---- 预生成 security/selinux 的派生头文件 ----
 # out/security/selinux/flask.h 不是源码,是 scripts/selinux/genheaders/genheaders
@@ -283,52 +306,53 @@ gen_flask_header() {
 apply_config() {
 # 唯一的配置来源。预检和整树编译都调这个函数 —— 绝不允许两处各写一份。
 #
-# 踩过的坑:预检原来只 `scripts/config -e KSU -e KPM`,没关 SUSFS。而
-# config KSU_SUSFS 的 Kconfig 默认值是 `default y`(只 depends on KSU),
-# 于是预检那次编译里 CONFIG_KSU_SUSFS / _SUS_PATH / _SUS_MOUNT 全是开的,
-# core_hook.c 里那几段被守卫的代码照样进编译,报出
-# "use of undeclared identifier 'CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH'"。
-# 真正的整树编译因为后面有 -d KSU_SUSFS 本来是能过的 —— 也就是说预检对着
-# 一份【和真构建不同的配置】给假警报,而它唯一的价值就是"提前 30 分钟报错",
-# 一旦配置分叉就从省时间变成白烧一轮 runner。共用函数就是为了根除这个。
+# 早先预检和整树各写一份 scripts/config,两边配置分叉,预检对着一份
+# 【和真构建不同的配置】给假警报,而它唯一的价值就是"提前二十几分钟报错",
+# 一旦分叉就从省时间变成白烧一轮 runner。共用函数就是为了根除这个。
+#
+# 选项名严格对齐 197cad88 的 kernel/Kconfig,不 enable 那一版上不存在的符号
+# (scripts/config 对不存在的选项照样会写一行 "# CONFIG_X is not set",
+#  无害,但会让人以为"配过了")。
+#
+#   KSU                          必开。depends on KPROBES && EXT4_FS
+#   KSU_MANUAL_SU                手动 su(上游默认 y),按原样保留
+#   KPM                          Kernel Patch Module 接收端,原作者的包也开着
+#   KSU_DEBUG                    关。pr_info 本身不受它控制,照常出日志
+#   KSU_DISABLE_MANAGER          关 = 保留管理器识别(我们靠这个)
+#   KSU_DISABLE_POLICY           关 = 保留 per-app root 策略
+#   KSU_X86_PATCH_SYSCALL_DISPATCHER  x86 专用,arm64 上无意义
+#
+# 197cad88 的 Kconfig 里【没有 SUSFS,也没有 KSU_MANUAL_HOOK】,上一版那套
+# "从 Kconfig 里动态提取 KSU_SUSFS* 全部关掉"的逻辑连同它的前提一起作废了。
+# 那段逻辑本身没错(手写清单漏过一次选项),但它守的是一个已经不存在的风险。
 scripts/config --file out/.config \
     -e KSU \
+    -e KSU_MANUAL_SU \
     -e KPM \
-    -e KSU_MANUAL_HOOK \
     -d KSU_DEBUG \
-    -d KSU_CMDLINE \
-    -d KSU_ALLOWLIST_WORKAROUND \
-    -d KSU_MULTI_MANAGER_SUPPORT
+    -d KSU_DISABLE_MANAGER \
+    -d KSU_DISABLE_POLICY \
+    -d KSU_X86_PATCH_SYSCALL_DISPATCHER
 
-# SUSFS 整组必须关,而这组选项的默认值【几乎全是 y】,漏一条就翻车。
-#
-#   config KSU_SUSFS                  default y
-#   config KSU_SUSFS_SUS_SU           default y   ← 上一次就是死在这条上
-#
-# SUSFS 依赖内核树侧的 fs/susfs.c(susfs4ksu 补丁),这棵树没打,所以只要
-# CONFIG_KSU_SUSFS* 是 y,KSU 子树(core_hook.c 等)就会引用一批不存在的
-# CMD_SUSFS_* 标识符,直接编译失败。
-#
-# 选项名不再手写清单,直接从挂上来的 drivers/kernelsu/Kconfig 里提取全部
-# KSU_SUSFS* —— 手写清单已经栽过一次:329b7f59 的 Kconfig 有 15 个 SUSFS 选项,
-# 我抄的 14 个少一条 KSU_SUSFS_SUS_SU(它的 depends 里带 KPROBES && HAVE_KPROBES
-# && KPROBE_EVENTS,不在前 14 条的命名模式里,肉眼扫极易漏)。
-# 上游增删选项时这段不用跟着改,漏一条的后果是整轮 runner 白烧,值得多写这几行。
-SUSFS_OPTS=$(sed -n 's/^config \(KSU_SUSFS[A-Z_]*\)$/\1/p' drivers/kernelsu/Kconfig | sort -u)
-SUSFS_N=$(printf '%s\n' "$SUSFS_OPTS" | grep -c . || true)
-if [ "${SUSFS_N:-0}" -lt 1 ]; then
-    echo "❌ 从 drivers/kernelsu/Kconfig 里没提取到任何 KSU_SUSFS* 选项,Kconfig 结构变了?"
-    exit 1
+# 依赖不满足时 Kconfig 会【静默丢弃】CONFIG_KSU,编出一个看着成功、
+# 实则根本没有 KSU 的内核。这里逐条硬查,缺一条就当场停。
+echo "[cfg] 检查 KSU 的 Kconfig 依赖是否真的满足 ..."
+missing=0
+for opt in KPROBES EXT4_FS; do
+    if grep -qE "^CONFIG_${opt}=y" out/.config; then
+        echo "  ✅ CONFIG_${opt}=y"
+    else
+        echo "  ❌ CONFIG_${opt} 不是 y —— config KSU depends on KPROBES && EXT4_FS,"
+        echo "     Kconfig 会把 CONFIG_KSU 整个丢掉,内核里就不会有 KSU"
+        missing=1
+    fi
+done
+if ! grep -qE '^CONFIG_KSU=y' out/.config; then
+    echo "  ❌ CONFIG_KSU 没有生效。Kconfig 把它丢了,或 drivers/kernelsu 没接进构建。"
+    missing=1
 fi
-echo "[cfg] 关掉 ${SUSFS_N} 个 KSU_SUSFS* 选项:$(echo "$SUSFS_OPTS" | tr '\n' ' ')"
-susfs_args=()
-while IFS= read -r o; do
-    [ -n "$o" ] && susfs_args+=(-d "$o")
-done <<< "$SUSFS_OPTS"
-scripts/config --file out/.config "${susfs_args[@]}"
+[ "$missing" -eq 0 ] || exit 1
 
-# KPM 靠 select 拉进来的 KALLSYMS_ALL 会把全量符号名塞进 Image。
-# 这正好让 CI 的 strings 校验能真的查到 KernelSU 符号,而不是靠字符串残留蒙。
 scripts/config --file out/.config \
     --set-str STATIC_USERMODEHELPER_PATH /system/bin/micd \
     -e PERF_CRITICAL_RT_TASK	\
@@ -359,17 +383,9 @@ scripts/config --file out/.config \
     -e RTMM \
 
 # 打印实际生效的关键选项,免得"配了但没生效"这种事静默过去。
-# SUSFS 也一并打出来:它默认值是 y,是最容易"忘了关"的一个。
 echo "===== 生效的关键选项 ====="
-grep -E '^CONFIG_(KSU|KPM|KSU_MANUAL_HOOK|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL)=' out/.config || true
-grep -E '^# CONFIG_(KSU_MANUAL_HOOK|KSU_DEBUG|KPROBES) is not set' out/.config || true
-echo "--- SUSFS 应全部关闭 ---"
-if grep -qE '^CONFIG_KSU_SUSFS' out/.config; then
-    echo "❌ CONFIG_KSU_SUSFS* 仍处于打开状态,KSU 子树会引用不存在的 fs/susfs.c"
-    grep -E '^CONFIG_KSU_SUSFS' out/.config
-    exit 1
-fi
-echo "  ✅ 无 CONFIG_KSU_SUSFS* 打开"
+grep -E '^CONFIG_(KSU|KPM|KSU_MANUAL_SU|KSU_DEBUG|KSU_DISABLE_MANAGER|KSU_DISABLE_POLICY|KPROBES|KALLSYMS|KALLSYMS_ALL)=y$' out/.config || true
+grep -E '^# CONFIG_(KSU|KSU_DEBUG|KPROBES|EXT4_FS) is not set' out/.config || true
 echo "============================="
 }
 
@@ -385,16 +401,32 @@ rm -f /tmp/preflight.log
 
 # 目标名必须带结尾斜杠。kbuild 对已存在的目录目标不做任何事,make 视为 up-to-date
 # 直接 exit 0 —— 那样预检就是空跑:上一轮 13 秒报"编译通过",整树阶段照样 83 个错误。
-# 所以光看退出码不够,还要数 .o。KSU 有 9 个 + selinux 3 个 + kpm 3 个 = 15 个源文件,
-# 门槛设 5 既有足够区分度,又不会因为内核版本差异导致误报。
+# 所以光看退出码不够,还要数 .o,并且核对的是【新版目录结构】里的那几个文件。
+#
+# 197cad88 的 kernel/Kbuild 在 CONFIG_KSU=y、KPM=y、DISABLE_*=n 时会编 27 个 .o。
+# 门槛设 20:既能区分"真的编了"和"空跑",又给内核版本差异留了余量。
+#
+# 更有用的是下面这条路径断言 —— 上一轮把用户手机刷废,根因就是"编的不是
+# 我以为的那一版",而产物外观完全看不出差别。这里直接点名 197cad88 才有的
+# hook/arm64/syscall_hook.o:它不存在,就说明挂上去的根本不是新版 KSU。
 if make $MAKE_ARGS -k drivers/kernelsu/ >/tmp/preflight.log 2>&1; then
     NOBJ=$(find out/drivers/kernelsu -name '*.o' 2>/dev/null | wc -l | tr -d ' ')
-    if [ "${NOBJ:-0}" -lt 5 ]; then
+    if [ "${NOBJ:-0}" -lt 20 ]; then
         echo "[preflight] ❌ make 退出 0 但只产出 ${NOBJ} 个 .o —— 预检在空跑,不可信"
         grep -E "Nothing to be done|No rule to make target" /tmp/preflight.log | head -8
         exit 1
     fi
-    echo "[preflight] ✅ KSU 目录编译通过(${NOBJ} 个 .o)"
+    for must in core/init.o hook/arm64/syscall_hook.o infra/symbol_resolver.o \
+                runtime/ksud_integration.o supercall/dispatch.o; do
+        if [ ! -f "out/drivers/kernelsu/${must}" ]; then
+            echo "[preflight] ❌ 缺 out/drivers/kernelsu/${must}"
+            echo "   197cad88 的 kernel/Kbuild 一定会编它。缺了就说明挂上去的"
+            echo "   不是这一版 KSU(很可能是旧的扁平目录结构)—— 停在这里,"
+            echo "   别让它编出一个"看着成功、实则版本不对"的内核。"
+            exit 1
+        fi
+    done
+    echo "[preflight] ✅ KSU 目录编译通过(${NOBJ} 个 .o,新版目录结构已确认)"
 else
     if grep -q "No rule to make target" /tmp/preflight.log; then
         # 目标名在这个内核版本上不认,不是真错误,放行让整树编译去暴露问题
@@ -514,6 +546,17 @@ fi
 [ -f out/arch/arm64/boot/Image ] || { echo "编译失败:没有生成 Image"; exit 1; }
 echo "[build] Image 生成成功"
 
+# KSU 对外报的版本号是 Kbuild 用 `40000 + git rev-list --count main - 2815`
+# 算出来的,管理器读的就是这个数。它不是装饰 —— 算错了就是交了一份对不上
+# 的货。这里把构建日志里 Kbuild 自己打印的那行原样抓出来,进 BUILD_INFO。
+KSU_VERSION_REPORTED=$(grep -oE 'SukiSU-Ultra version: [0-9]+ \[[^]]*\]' /tmp/build.log | head -1 || true)
+if [ -z "$KSU_VERSION_REPORTED" ]; then
+    echo "❌ 构建日志里找不到 Kbuild 打印的 KSU 版本号 —— 版本锁没生效?"
+    grep -m3 'version:' /tmp/build.log || true
+    exit 1
+fi
+echo "[build] ${KSU_VERSION_REPORTED}"
+
 find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > out/arch/arm64/boot/dtb
 
 # ---- KPM 基础设施:编译后必须再 patch 一次内核 ----
@@ -558,11 +601,15 @@ SukiSU 实际 : ${KSU_ACTUAL_REF}
 SukiSU 提交 : $(git -C KernelSU log -1 --format='%ad %s' --date=short)
 提交时间   : $(git -C KernelSU log -1 --format=%aI)
 文件名标签 : ${KSU_LABEL}
-兼容补丁   : ${KSU_PATCH}  ($(md5sum "$KSU_PATCH" | cut -d' ' -f1))
-SUSFS 配置 : 整组关闭(这棵树没有 susfs4ksu 内核侧补丁 fs/susfs.c)
+KSU 版本号 : ${KSU_VERSION_REPORTED:-未取到}
+manager 包名: ${KSU_MANAGER_PACKAGE:-(不校验,仅校验 APK 签名)}
+manager 签名: size=${KSU_EXPECTED_SIZE:-0x35c} sha256=${KSU_EXPECTED_HASH:-上游默认}
+内核侧补丁 : ${KERNEL_PATCH_ABS}  ($(md5sum "$KERNEL_PATCH_ABS" | cut -d' ' -f1))
+KSU 侧补丁 : ${KSU_PATCH_ABS}  ($(md5sum "$KSU_PATCH_ABS" | cut -d' ' -f1))
+挂钩方式   : kprobes + 改写 sys_call_table(内核树里预埋的 ksu_*_hook 调用点已摘除)
+KSU 选项   : KSU=y KSU_MANUAL_SU=y KPM=y 其余关
+依赖检查   : CONFIG_KPROBES=y CONFIG_EXT4_FS=y
 内核版本   : $(strings -a dist/Image_cas_sukisu | grep -m1 -o 'Linux version [^ ]*' || echo '(未取到)')
 Image 大小 : $(stat -c%s dist/Image_cas_sukisu) 字节
 Image md5  : $(md5sum dist/Image_cas_sukisu | cut -d' ' -f1)
 EOF
-echo "----- 构建凭据 -----"
-cat dist/BUILD_INFO.txt

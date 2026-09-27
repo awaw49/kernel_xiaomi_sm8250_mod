@@ -4,24 +4,25 @@ on:
   workflow_dispatch:
   push:
     branches: [cas-ksu-v4-kprobes]
+    # 只认真实存在的文件。GitHub Actions 只读 .github/workflows/ 下的 yml,
+    # 仓库根的同名 yml 是死文件 —— 往那儿改等于没改,栽过。
     paths:
       - 'build_cas_sukisu.sh'
       - '.github/workflows/build-cas-sukisu-v2.yml'
-      - 'ksu-4.19-compat.patch'
+      - 'ksu-4.19-kprobes.patch'
+      - 'ksu-4.19-main.patch'
       - 'arch/arm64/configs/cas_defconfig'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 300
-    # 这里【故意不设】env: SUKISU_REF。
-    # job 级 env 会覆盖脚本里的 ${SUKISU_REF:-...},而脚本才是版本锁的地方。
-    # 之前这里钉的是 f4863b20、脚本里钉的是 329b7f59,env 优先级更高,于是
-    # 实际编的是 f4863b20,脚本却按 329b7f59 的默认值配置 Kconfig、
-    # 在 zip 文件名上印 329b7f59 —— 三处互相矛盾,且从产物上看不出来。
-    # "单一事实来源"只有在不存在更高优先级来源时才成立。
-    # 真实编到哪一版,以脚本 checkout 后核对出的 SHA 为准,见 dist/BUILD_INFO.txt。
-
+    # 这里【绝对不能】有 env: SUKISU_REPO / SUKISU_REF。
+    # job 级 env 的优先级高于脚本里的 ${SUKISU_REF:-...},一旦在这里写死,
+    # 脚本里那行"版本锁"就是一句空话 —— 编译日志、zip 文件名、BUILD_INFO
+    # 会各自印着不同的版本号,而产物外观上完全看不出差别。
+    # 上一次把用户手机刷废,根因就是锁错了仓库(个人 fork 而非上游)。
+    # 版本锁的唯一事实来源就是 build_cas_sukisu.sh 顶部的两行。
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -86,8 +87,6 @@ jobs:
 
       - name: Report toolchain
         run: |
-          echo "SukiSU 版本锁在 build_cas_sukisu.sh(本 workflow 不设 env 以免覆盖它)"
-          grep -E '^SUKISU_(REPO|REF)=' build_cas_sukisu.sh || true
           echo "CLANG_BIN=$CLANG_BIN"
           $CLANG_BIN/clang --version
           aarch64-linux-gnu-ld --version | head -1
@@ -100,33 +99,22 @@ jobs:
 
       # 校验要有,但只能校验测得准的东西。下面两条曾经栽过跟头,都删了:
       #   1. `strings | grep -cxE register_kprobe` —— kallsyms 符号名是压缩的,
-      #      恒为 0,和 MANUAL_HOOK / KPROBES 模式无关。
+      #      恒为 0,和 kprobes / MANUAL_HOOK 模式都无关。
       #   2. `strings | grep -q "KPROBES is disabled"` —— 这个字面量在
       #      CONFIG_KPROBES=y 的内核里同样存在,检测不出任何东西。
-      - name: Verify KSU landed in the Image
+      #
+      # 真正测得准的有两条:
+      #   - "KernelSU" 字符串字面量数(原厂内核为 0)
+      #   - 挂上去的必须是 197cad88 的新版目录结构(构建脚本里已硬断言,
+      #     这里再从产物侧独立复核一次,不共用同一段逻辑)
+      - name: Verify
         run: |
           set -euo pipefail
           IMG=dist/Image_cas_sukisu
           test -f "$IMG" || { echo "❌ 没有产出 Image"; exit 1; }
           ls -la dist/
-          # 构建凭据由脚本产出(它核对过实际 checkout 的 SHA),这里只读不推断。
-          # 自己 echo $SUKISU_REF 是推断不是事实 —— 那正是上次版本对不上的原因。
-          test -f dist/BUILD_INFO.txt || { echo "❌ 没有 dist/BUILD_INFO.txt"; exit 1; }
           cat dist/BUILD_INFO.txt
-          cat dist/BUILD_INFO.txt >> "$GITHUB_STEP_SUMMARY"
 
-          # 这里只用【字符串字面量】做判据,不去 strings 里找符号名。
-          # arm64 的 kallsyms 符号名存在 kallsyms_names 里,是 deflate 压缩的,
-          # strings 压根看不到 —— 所以任何 `grep -c register_kprobe` 之类的检查
-          # 恒为 0,和符号在不在内核里毫无关系。前两轮白扔产物都栽在这上面。
-          #
-          # 挂钩符号真的接上了没有,不用靠猜:链接器已经验过了。vmlinux 链接成功
-          # 本身就意味着 ksu_vfs_read_hook / ksu_execveat_hook / ksu_input_hook
-          # 有定义 —— 这棵树出厂就预埋了它们的调用点,没接上就是 undefined
-          # reference 直接失败,那个坑我们已经踩过一次。
-          #
-          # "KernelSU" 是 KSU 源码里真实的 pr_info 等字符串字面量,不会被压缩。
-          # 原厂内核里这个数是 0,所以"从 0 变成非 0"本身就是有效判据。
           KSU_STR=$(strings -a "$IMG" | grep -c "KernelSU" || true)
           echo "  KernelSU 字符串数: $KSU_STR   (原厂内核为 0)"
           if [ "${KSU_STR:-0}" -lt 10 ]; then
@@ -134,11 +122,22 @@ jobs:
             exit 1
           fi
 
+          # 197cad88 的 hook/syscall_hook_manager.c 里有这么一句独有的日志。
+          # 329b7f59 及更早的版本没有这个目录、也没有这句话,所以它是一条
+          # 只可能来自新版的、不会被旧版本误命中的指纹。
+          NEW=$(strings -a "$IMG" | grep -c "registered syscall hook for nr" || true)
+          echo "  新版 syscall hook 指纹: $NEW"
+          if [ "${NEW:-0}" -lt 1 ]; then
+            echo "  ❌ 找不到 197cad88 独有的 syscall hook 指纹"
+            echo "     这份 Image 很可能不是用上游 main 编出来的。"
+            exit 1
+          fi
+
           echo "  Image 大小: $(stat -c%s "$IMG") 字节"
           echo "  内核版本: $(strings -a "$IMG" | grep -m1 -o 'Linux version [^ ]*' || echo '(未取到)')"
-          echo "✅ Image 校验通过"
+          echo "✅ 校验通过"
 
-      # 用 always():校验脚本万一又写错,不该连带把已经编好的半小时产物一起扔掉。
+      # 用 always():校验脚本万一又写错,不该连带把已经编好的产物一起扔掉。
       # 校验失败时产物照样上来,可以下载到本地自己看,而不是重跑一次构建。
       - name: Upload artifact
         if: always()

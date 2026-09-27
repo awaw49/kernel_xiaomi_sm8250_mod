@@ -1,0 +1,47 @@
+--- a/kernel/include/ksu.h
++++ b/kernel/include/ksu.h
+@@ -3,10 +3,32 @@
+ 
+ #include <linux/types.h>
+ #include <linux/cred.h>
+ #include <linux/workqueue.h>
++#include <linux/version.h>
++#include <linux/uaccess.h>
+ 
+ #define KERNEL_SU_VERSION KSU_VERSION
++
++// 4.19 没有 copy_{from,to}_user_nofault —— 这两个是 5.8 才引进的。
++// runtime/ksud_integration.c 直接调它们,不做垫片就是编译不过。
++// 4.19 上唯一等价物就是普通的 copy_*_user(内核里 fault 会被 fixup 兜住)。
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
++#ifndef copy_from_user_nofault
++static inline long copy_from_user_nofault(void *to, const void __user *from,
++					  unsigned long n)
++{
++	return copy_from_user(to, from, n);
++}
++#endif
++#ifndef copy_to_user_nofault
++static inline long copy_to_user_nofault(void __user *to, const void *from,
++					unsigned long n)
++{
++	return copy_to_user(to, from, n);
++}
++#endif
++#endif
+ 
+ extern struct cred *ksu_cred;
+ extern bool ksu_late_loaded;
+ extern bool allow_shell;
+--- a/kernel/Kbuild
++++ b/kernel/Kbuild
+@@ -194,6 +194,9 @@
+ ccflags-y += -DKSU_NEW_DCACHE_FLUSH=$(KSU_NEW_DCACHE_FLUSH)
+ 
+ ccflags-y += -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat -Wno-missing-prototypes
+ ccflags-y += -Wno-declaration-after-statement -Wno-unused-function
++# cas_defconfig 里 CONFIG_CC_WERROR=y,KSU 是外来的第三方代码,一两条无害告警
++# 不该把整个内核构建判死。只对 KSU 放宽,内核树本身仍然 Werror。
++ccflags-y += -Wno-error
+ 
+ # Keep a new line here!! Because someone may append config
