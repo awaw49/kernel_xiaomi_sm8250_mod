@@ -1,42 +1,17 @@
---- a/kernel/include/ksu.h
-+++ b/kernel/include/ksu.h
-@@ -3,10 +3,32 @@
- 
- #include <linux/types.h>
- #include <linux/cred.h>
- #include <linux/workqueue.h>
-+#include <linux/version.h>
-+#include <linux/uaccess.h>
- 
- #define KERNEL_SU_VERSION KSU_VERSION
-+
-+// 4.19 没有 copy_{from,to}_user_nofault —— 这两个是 5.8 才引进的。
-+// runtime/ksud_integration.c 直接调它们,不做垫片就是编译不过。
-+// 4.19 上唯一等价物就是普通的 copy_*_user(内核里 fault 会被 fixup 兜住)。
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
-+#ifndef copy_from_user_nofault
-+static inline long copy_from_user_nofault(void *to, const void __user *from,
-+					  unsigned long n)
-+{
-+	return copy_from_user(to, from, n);
-+}
-+#endif
-+#ifndef copy_to_user_nofault
-+static inline long copy_to_user_nofault(void __user *to, const void *from,
-+					unsigned long n)
-+{
-+	return copy_to_user(to, from, n);
-+}
-+#endif
-+#endif
- 
- extern struct cred *ksu_cred;
- extern bool ksu_late_loaded;
- extern bool allow_shell;
 --- a/kernel/Kbuild
 +++ b/kernel/Kbuild
-@@ -194,6 +194,9 @@
- ccflags-y += -DKSU_NEW_DCACHE_FLUSH=$(KSU_NEW_DCACHE_FLUSH)
+@@ -82,6 +82,10 @@
+ endif
+ 
+ ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include
++# 4.19 适配垫片统一放 kernel/kernel_compat.h,靠 -include 强制注入每一个 .o。
++# 否则得逐个去改 41 个源文件的 include 顺序。上游自己用 -include 塞 errno.h,
++# 同一个套路。宏在使用点才展开,所以这里先定义不要求 uaccess.h 已经进来。
++ccflags-y += -include $(KSU_KERNEL_DIR)/kernel_compat.h
+ 
+ obj-$(CONFIG_KSU) += kernelsu.o
+ 
+@@ -195,5 +199,8 @@
  
  ccflags-y += -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat -Wno-missing-prototypes
  ccflags-y += -Wno-declaration-after-statement -Wno-unused-function
@@ -45,3 +20,105 @@
 +ccflags-y += -Wno-error
  
  # Keep a new line here!! Because someone may append config
+--- a/kernel/kernel_compat.h
++++ b/kernel/kernel_compat.h
+@@ -21,4 +21,99 @@
+     return copy_from_user(to, from, count);
+ }
+ 
++/*
++ * ============================================================================
++ * 4.19 适配垫片
++ *
++ * 上游 2024-06 的 898e9d4f "[1.0] Drop Non-GKI Support" 主动砍掉了 4.19,
++ * 之后 *_nofault 用户态拷贝原语、access_ok 的新签名都只按 5.8+ 写。
++ * 这里把缺失的那几个补回去,让 KSU 主体能编进 4.19。
++ *
++ * 全部用 LINUX_VERSION_CODE 收口,5.8+ 的内核走不到这里,行为完全不变。
++ * ============================================================================
++ */
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
++
++/*
++ * access_ok:5.8 起从 3 参(access_ok(type, addr, size))缩成 2 参
++ * (access_ok(addr, size))。type 参数在 arm64 上从来就没被用过 ——
++ * 4.19 的 arch/arm64 定义就是 __range_ok(addr, size),直接扔掉 type。
++ *
++ * KSU 里 10 处调用(kpm/kpm.c)全是 2 参形式,所以这里反向补一个 2 参宏。
++ * #undef 之后再写 access_ok(...) 展开到的就是内核头文件里那个 3 参版本 ——
++ * 宏在使用点才展开,而使用点一定在所有 #include 之后,那时 3 参版本已就位。
++ * 这 10 处都是校验用户传进来的指针,用 _write 还是 _read 没有差别。
++ */
++#undef access_ok
++#define access_ok(_addr, _size) access_ok(0, (void *)(_addr), (unsigned long)(_size))
++
++/*
++ * copy_{from,to}_user_nofault:5.8 引进,4.19 上没有。
++ * nofault 版的价值在于不触发缺页异常处理,这里退回普通 copy_*_user ——
++ * 调用它们的三个文件(feature/sucompat.c、runtime/ksud_integration.c、
++ * sulog/event.c)全都在进程上下文里,可以睡,fault 由 fixup 兜住。
++ */
++#ifndef copy_from_user_nofault
++static inline long copy_from_user_nofault(void *to, const void __user *from,
++					  unsigned long n)
++{
++	return copy_from_user(to, from, n);
++}
+ #endif
++
++#ifndef copy_to_user_nofault
++static inline long copy_to_user_nofault(void __user *to, const void *from,
++					unsigned long n)
++{
++	return copy_to_user(to, from, n);
++}
++#endif
++
++/*
++ * copy_to_kernel_nofault:5.8 引进,4.19 上没有。
++ * hook/{arm64,x86_64}/patch_memory.c 用它改内核里的指令 —— 那边两个指针都是
++ * 内核虚拟地址而非用户地址,实际语义就是一次拷贝。选 copy_from_user 而不是
++ * memcpy,是为了和上游的 fault 语义保持一致,不做更激进的改写。
++ */
++#ifndef copy_to_kernel_nofault
++static inline long copy_to_kernel_nofault(void *to, const void *from,
++					  unsigned long n)
++{
++	return copy_from_user(to, (const void __user *)from, n);
++}
++#endif
++
++/*
++ * strncpy_from_user_nofault:5.8 引进,4.19 的 include/linux/uaccess.h 里
++ * 根本没有这个名字。语义:成功返回拷贝的字节数,失败返回负 errno,不清零结尾。
++ *
++ * 调用点(feature/sucompat.c ×2、runtime/ksud_integration.c、
++ * sulog/event.c ×2)都是 `if (ret <= 0) 报错` 或直接当长度用,所以
++ * "全拷成功返回 count、出错返回 -EFAULT"这个契约对得上。
++ * 4.19 的 copy_from_user 返回的是【没拷成功的字节数】,极性相反,这里翻过来。
++ */
++#ifndef strncpy_from_user_nofault
++static inline long strncpy_from_user_nofault(char *dst,
++					      const void __user *src,
++					      size_t count)
++{
++	long ret;
++
++	if (!count)
++		return 0;
++	ret = copy_from_user(dst, src, count);
++	if (ret)
++		return -EFAULT;
++	return (long)count;
++}
++#endif
++
++/* fallthrough:4.19 的 compiler_types.h 里没有这个宏,5.9 才加。 */
++#ifndef fallthrough
++#define fallthrough
++#endif
++
++#endif /* LINUX_VERSION_CODE < 5.8.0 */
++
++#endif
