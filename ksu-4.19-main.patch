@@ -22,7 +22,22 @@
  # Keep a new line here!! Because someone may append config
 --- a/kernel/kernel_compat.h
 +++ b/kernel/kernel_compat.h
-@@ -21,4 +21,96 @@
+@@ -1,8 +1,12 @@
+-#ifndef __KSU_H_KERNEL_COMPAT
+-#define __KSU_H_KERNEL_COMPAT
++#ifndef __KSU_KERNEL_COMPAT_H
++#define __KSU_KERNEL_COMPAT_H
+ 
+ #include <linux/fs.h>
+ #include <linux/version.h>
++
++/* -include 强制注入导致本文件先于 .c 的 #include 被处理,自己把底座拉进来。 */
++#include <linux/uaccess.h>
++#include <linux/errno.h>
+ 
+ /*
+  * ksu_copy_from_user_retry
+@@ -21,4 +25,86 @@
      return copy_from_user(to, from, count);
  }
  
@@ -39,16 +54,6 @@
 + */
 +
 +#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
-+
-+/*
-+ * 下面几个垫片直接调 copy_*_user,而本文件是被 Kbuild 用 -include 强制注入的
-+ * —— 也就是说它比 .c 自己的 #include 都先被处理,<linux/uaccess.h> 那时还没进来。
-+ * 不在这里自己 include 一次,每个垫片里的 copy_from_user 都是隐式声明,
-+ * 还会跟 uaccess.h:144 的真身撞出 "static declaration follows non-static"。
-+ * 踩过,CI 36314172220 报的就是这个。
-+ */
-+#include <linux/uaccess.h>
-+#include <linux/errno.h>
 +
 +/*
 + * copy_{from,to}_user_nofault:5.8 引进。这棵 vendor 4.19 没有。
@@ -207,3 +212,29 @@
          pr_err("kpm: invalid result_code pointer %px\n",
                 (void *)cmd.result_code);
          return -EFAULT;
+--- a/kernel/core/init.c
++++ b/kernel/core/init.c
+@@ -237,8 +237,6 @@
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("weishu");
+ MODULE_DESCRIPTION("Android KernelSU");
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+-MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+-#else
+-MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+-#endif
++/* MODULE_IMPORT_NS 是 6.13 才有的符号命名空间机制,4.19 完全没有这回事。
++ * 留着它的话 #else 分支里那个裸标识符会被当成 C 代码解析,报
++ * "a parameter list without types"。整块删掉。 */
+--- a/kernel/feature/sucompat.c
++++ b/kernel/feature/sucompat.c
+@@ -4,7 +4,8 @@
+ #include <linux/preempt.h>
+ #include <linux/printk.h>
+ #include <linux/mm.h>
+-#include <linux/pgtable.h>
++/* linux/pgtable.h 是 5.10 才有的转发头,4.19 没有。这文件要的
++ * pte 访问原语,4.19 上由上面已经 include 的 <linux/mm.h> 提供。 */
+ #include <linux/uaccess.h>
+ #include <asm/current.h>
+ #include <linux/cred.h>
