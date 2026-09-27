@@ -22,7 +22,7 @@
  # Keep a new line here!! Because someone may append config
 --- a/kernel/kernel_compat.h
 +++ b/kernel/kernel_compat.h
-@@ -21,4 +21,99 @@
+@@ -21,4 +21,96 @@
      return copy_from_user(to, from, count);
  }
  
@@ -41,20 +41,17 @@
 +#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
 +
 +/*
-+ * access_ok:5.8 起从 3 参(access_ok(type, addr, size))缩成 2 参
-+ * (access_ok(addr, size))。type 参数在 arm64 上从来就没被用过 ——
-+ * 4.19 的 arch/arm64 定义就是 __range_ok(addr, size),直接扔掉 type。
-+ *
-+ * KSU 里 10 处调用(kpm/kpm.c)全是 2 参形式,所以这里反向补一个 2 参宏。
-+ * #undef 之后再写 access_ok(...) 展开到的就是内核头文件里那个 3 参版本 ——
-+ * 宏在使用点才展开,而使用点一定在所有 #include 之后,那时 3 参版本已就位。
-+ * 这 10 处都是校验用户传进来的指针,用 _write 还是 _read 没有差别。
++ * 下面几个垫片直接调 copy_*_user,而本文件是被 Kbuild 用 -include 强制注入的
++ * —— 也就是说它比 .c 自己的 #include 都先被处理,<linux/uaccess.h> 那时还没进来。
++ * 不在这里自己 include 一次,每个垫片里的 copy_from_user 都是隐式声明,
++ * 还会跟 uaccess.h:144 的真身撞出 "static declaration follows non-static"。
++ * 踩过,CI 36314172220 报的就是这个。
 + */
-+#undef access_ok
-+#define access_ok(_addr, _size) access_ok(0, (void *)(_addr), (unsigned long)(_size))
++#include <linux/uaccess.h>
++#include <linux/errno.h>
 +
 +/*
-+ * copy_{from,to}_user_nofault:5.8 引进,4.19 上没有。
++ * copy_{from,to}_user_nofault:5.8 引进。这棵 vendor 4.19 没有。
 + * nofault 版的价值在于不触发缺页异常处理,这里退回普通 copy_*_user ——
 + * 调用它们的三个文件(feature/sucompat.c、runtime/ksud_integration.c、
 + * sulog/event.c)全都在进程上下文里,可以睡,fault 由 fixup 兜住。
@@ -122,3 +119,91 @@
 +#endif /* LINUX_VERSION_CODE < 5.8.0 */
 +
 +#endif
+--- a/kernel/kpm/kpm.c
++++ b/kernel/kpm/kpm.c
+@@ -134,14 +134,14 @@
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg1, 255)) {
++        if (!access_ok(0, arg1, 255)) {
+             goto invalid_arg;
+         }
+ 
+         strncpy_from_user((char *)&kernel_load_path, (const char *)arg1, 255);
+ 
+         if (arg2 != 0) {
+-            if (!access_ok(arg2, 255)) {
++            if (!access_ok(0, arg2, 255)) {
+                 goto invalid_arg;
+             }
+ 
+@@ -160,7 +160,7 @@
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg1, sizeof(kernel_name_buffer))) {
++        if (!access_ok(0, arg1, sizeof(kernel_name_buffer))) {
+             goto invalid_arg;
+         }
+ 
+@@ -180,7 +180,7 @@
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg1, sizeof(kernel_name_buffer))) {
++        if (!access_ok(0, arg1, sizeof(kernel_name_buffer))) {
+             goto invalid_arg;
+         }
+ 
+@@ -191,7 +191,7 @@
+         sukisu_kpm_info((const char *)&kernel_name_buffer, (char *)&buf,
+                         sizeof(buf), &size);
+ 
+-        if (!access_ok(arg2, size)) {
++        if (!access_ok(0, arg2, size)) {
+             goto invalid_arg;
+         }
+ 
+@@ -206,7 +206,7 @@
+             goto exit;
+         }
+ 
+-        if (!access_ok(arg2, len)) {
++        if (!access_ok(0, arg2, len)) {
+             goto invalid_arg;
+         }
+ 
+@@ -224,11 +224,11 @@
+         char kpm_name[KPM_NAME_LEN] = { 0 };
+         char kpm_args[KPM_ARGS_LEN] = { 0 };
+ 
+-        if (!access_ok(arg1, sizeof(kpm_name))) {
+-            goto invalid_arg;
+-        }
+-
+-        if (!access_ok(arg2, sizeof(kpm_args))) {
++        if (!access_ok(0, arg1, sizeof(kpm_name))) {
++            goto invalid_arg;
++        }
++
++        if (!access_ok(0, arg2, sizeof(kpm_args))) {
+             goto invalid_arg;
+         }
+ 
+@@ -288,13 +288,13 @@
+         return -EFAULT;
+     }
+ 
+-    if (!access_ok(cmd.control_code, sizeof(int))) {
++    if (!access_ok(0, cmd.control_code, sizeof(int))) {
+         pr_err("kpm: invalid control_code pointer %px\n",
+                (void *)cmd.control_code);
+         return -EFAULT;
+     }
+ 
+-    if (!access_ok(cmd.result_code, sizeof(int))) {
++    if (!access_ok(0, cmd.result_code, sizeof(int))) {
+         pr_err("kpm: invalid result_code pointer %px\n",
+                (void *)cmd.result_code);
+         return -EFAULT;
