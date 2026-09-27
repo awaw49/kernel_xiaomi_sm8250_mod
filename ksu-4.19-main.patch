@@ -22,7 +22,7 @@
  # Keep a new line here!! Because someone may append config
 --- a/kernel/kernel_compat.h
 +++ b/kernel/kernel_compat.h
-@@ -1,8 +1,122 @@
+@@ -1,8 +1,138 @@
 -#ifndef __KSU_H_KERNEL_COMPAT
 -#define __KSU_H_KERNEL_COMPAT
 +#ifndef __KSU_KERNEL_COMPAT_H
@@ -140,6 +140,22 @@
 + */
 +#ifndef selinux_cred
 +#define selinux_cred(_cred) ((_cred)->security)
++#endif
++
++/*
++ * TWA_RESUME:4.19 的 task_work_add(task, work, notify) 第三个参数是 bool,
++ * 没有后来那套 TWA_* 枚举。语义对应关系是 TWA_RESUME -> 通知调用者。
++ */
++#ifndef TWA_RESUME
++#define TWA_RESUME true
++#endif
++
++/*
++ * selinux_inode:5.x 的 helper,4.19 上没有 —— 内核内部就是
++ * inode->security。infra/file_wrapper.c 用它拿 inode 的 SELinux sid。
++ */
++#ifndef selinux_inode
++#define selinux_inode(_inode) ((struct inode_security_struct *)(_inode)->security)
 +#endif
 +
 +#endif /* LINUX_VERSION_CODE < 5.8.0 */
@@ -275,7 +291,7 @@
  #include "klog.h" // IWYU pragma: keep
 --- a/kernel/selinux/rules.c
 +++ b/kernel/selinux/rules.c
-@@ -1,533 +1,539 @@
+@@ -1,533 +1,541 @@
 -#include "linux/rcupdate.h"
 -#include "security.h"
  #include <linux/uaccess.h>
@@ -286,31 +302,26 @@
 -#include <linux/string.h>
 -
 -#include "uapi/selinux.h"
--#include "klog.h" // IWYU pragma: keep
 +
-+#include "../klog.h" // IWYU pragma: keep
+ #include "klog.h" // IWYU pragma: keep
  #include "selinux.h"
  #include "sepolicy.h"
  #include "ss/services.h"
 -#include "linux/lsm_audit.h" // IWYU pragma: keep
 +#include "linux/lsm_audit.h"
  #include "xfrm.h"
- 
+-
 -struct selinux_policy *backup_sepolicy;
 -
-+/*
-+ * 4.19:selinux_state 存在,但没有 policy 成员 —— policydb 是直接内嵌在
-+ * struct selinux_ss 里的(配 rwlock,不是 5.x 的 mutex)。
-+ * 下面 get_policydb() 走的就是这条 <5.10 的分支。
-+ * 上游 898e9d4f 之后把这条分支删了,这里按 329b7f59 的形态接回来。
-+ */
-+#define KSU_COMPAT_USE_SELINUX_STATE
++#include "avc.h"
 +
 +#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
  #define SELINUX_POLICY_INSTEAD_SELINUX_SS
 -
 +#endif
 +
++#define KERNEL_SU_DOMAIN "su"
++#define KERNEL_SU_FILE "ksu_file"
 +#define KERNEL_EXEC_TYPE "ksu_exec"
  #define ALL NULL
  
@@ -439,6 +450,13 @@
 +	ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
 +	ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
 +
++#ifdef CONFIG_KSU_SUSFS
++	// Allow umount in zygote process without installing zygisk
++	ksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");
++	susfs_set_init_sid();
++	susfs_set_ksu_sid();
++	susfs_set_zygote_sid();
++#endif
 +
 +	mutex_unlock(&ksu_rules);
 +}
@@ -530,12 +548,10 @@
 +	selinux_status_update_policyload(&selinux_state, 0);
  #endif
 -    selinux_xfrm_notify_policyload();
-+	selinux_xfrm_notify_policyload();
- }
- 
+-}
+-
 -void apply_kernelsu_rules()
-+int handle_sepolicy(unsigned long arg3, void __user *arg4)
- {
+-{
 -    struct selinux_policy *pol, *old_pol = selinux_state.policy;
 -    struct policydb *db;
 -
@@ -654,6 +670,375 @@
 -    reset_avc_cache();
 -out_unlock:
 -    mutex_unlock(&selinux_state.policy_mutex);
+-}
+-
+-#define KSU_SEPOLICY_MAX_BATCH_SIZE (8U * 1024U * 1024U)
+-#define KSU_SEPOLICY_MAX_ARGS 5
+-
+-struct sepol_data {
+-    u32 cmd;
+-    u32 subcmd;
+-};
+-
+-struct sepol_batch_cursor {
+-    const u8 *cur;
+-    const u8 *end;
+-};
+-
+-static size_t sepol_remaining(const struct sepol_batch_cursor *cursor)
+-{
+-    return (size_t)(cursor->end - cursor->cur);
+-}
+-
+-static int sepol_read_cmd_header(struct sepol_batch_cursor *cursor, struct sepol_data *header)
+-{
+-    if (sepol_remaining(cursor) < sizeof(*header)) {
+-        return -EINVAL;
+-    }
+-
+-    memcpy(header, cursor->cur, sizeof(*header));
+-    cursor->cur += sizeof(*header);
+-
+-    return 0;
+-}
+-
+-static int sepol_read_string(struct sepol_batch_cursor *cursor, const char **out)
+-{
+-    u32 len;
+-    const char *str;
+-
+-    if (sepol_remaining(cursor) < sizeof(len)) {
+-        return -EINVAL;
+-    }
+-
+-    memcpy(&len, cursor->cur, sizeof(len));
+-    cursor->cur += sizeof(len);
+-
+-    if (len >= sepol_remaining(cursor)) {
+-        return -EINVAL;
+-    }
+-
+-    str = (const char *)cursor->cur;
+-    if (memchr(str, '\0', len) != NULL || str[len] != '\0') {
+-        return -EINVAL;
+-    }
+-
+-    cursor->cur += len + 1;
+-    if (len == 0) {
+-        *out = ALL;
+-        return 0;
+-    }
+-
+-    *out = str;
+-    return 0;
+-}
+-
+-static int sepol_require_not_all(const char *value, const char *name)
+-{
+-    if (value != ALL) {
+-        return 0;
+-    }
+-
+-    pr_err("sepol: %s cannot be ALL.\n", name);
+-    return -EINVAL;
+-}
+-
+-static int sepol_expected_argc(u32 cmd)
+-{
+-    switch (cmd) {
+-    case KSU_SEPOLICY_CMD_NORMAL_PERM:
+-        return 4;
+-    case KSU_SEPOLICY_CMD_XPERM:
+-        return 5;
+-    case KSU_SEPOLICY_CMD_TYPE_STATE:
+-        return 1;
+-    case KSU_SEPOLICY_CMD_TYPE:
+-    case KSU_SEPOLICY_CMD_TYPE_ATTR:
+-        return 2;
+-    case KSU_SEPOLICY_CMD_ATTR:
+-        return 1;
+-    case KSU_SEPOLICY_CMD_TYPE_TRANSITION:
+-        return 5;
+-    case KSU_SEPOLICY_CMD_TYPE_CHANGE:
+-        return 4;
+-    case KSU_SEPOLICY_CMD_GENFSCON:
+-        return 3;
+-    default:
+-        return -EINVAL;
+-    }
+-}
+-
+-static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *header, const char **args)
+-{
+-    bool success = false;
+-    int ret;
+-
+-    switch (header->cmd) {
+-    case KSU_SEPOLICY_CMD_NORMAL_PERM:
+-        if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_ALLOW) {
+-            success = ksu_allow(db, args[0], args[1], args[2], args[3]);
+-        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_DENY) {
+-            success = ksu_deny(db, args[0], args[1], args[2], args[3]);
+-        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_AUDITALLOW) {
+-            success = ksu_auditallow(db, args[0], args[1], args[2], args[3]);
+-        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_DONTAUDIT) {
+-            success = ksu_dontaudit(db, args[0], args[1], args[2], args[3]);
+-        } else {
+-            pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
+-        }
+-        return success ? 0 : -EINVAL;
+-
+-    case KSU_SEPOLICY_CMD_XPERM:
+-        ret = sepol_require_not_all(args[3], "operation");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-        ret = sepol_require_not_all(args[4], "perm_set");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-
+-        if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_ALLOW) {
+-            success = ksu_allowxperm(db, args[0], args[1], args[2], args[4]);
+-        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_AUDITALLOW) {
+-            success = ksu_auditallowxperm(db, args[0], args[1], args[2], args[4]);
+-        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_DONTAUDIT) {
+-            success = ksu_dontauditxperm(db, args[0], args[1], args[2], args[4]);
+-        } else {
+-            pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
+-        }
+-        return success ? 0 : -EINVAL;
+-
+-    case KSU_SEPOLICY_CMD_TYPE_STATE:
+-        ret = sepol_require_not_all(args[0], "type");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-
+-        if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_STATE_PERMISSIVE) {
+-            success = ksu_permissive(db, args[0]);
+-        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_STATE_ENFORCE) {
+-            success = ksu_enforce(db, args[0]);
+-        } else {
+-            pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
+-        }
+-        return success ? 0 : -EINVAL;
+-
+-    case KSU_SEPOLICY_CMD_TYPE:
+-    case KSU_SEPOLICY_CMD_TYPE_ATTR:
+-        ret = sepol_require_not_all(args[0], "type");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-        ret = sepol_require_not_all(args[1], "attribute");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-
+-        if (header->cmd == KSU_SEPOLICY_CMD_TYPE) {
+-            success = ksu_type(db, args[0], args[1]);
+-        } else {
+-            success = ksu_typeattribute(db, args[0], args[1]);
+-        }
+-        if (!success) {
+-            pr_err("sepol: %d failed.\n", header->cmd);
+-            return -EINVAL;
+-        }
+-        return 0;
+-
+-    case KSU_SEPOLICY_CMD_ATTR:
+-        ret = sepol_require_not_all(args[0], "attribute");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-
+-        if (!ksu_attribute(db, args[0])) {
+-            pr_err("sepol: %d failed.\n", header->cmd);
+-            return -EINVAL;
+-        }
+-        return 0;
+-
+-    case KSU_SEPOLICY_CMD_TYPE_TRANSITION: {
+-        const char *object = ALL;
+-
+-        ret = sepol_require_not_all(args[0], "src");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-        ret = sepol_require_not_all(args[1], "tgt");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-        ret = sepol_require_not_all(args[2], "cls");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-        ret = sepol_require_not_all(args[3], "default_type");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-
+-        object = args[4];
+-
+-        success = ksu_type_transition(db, args[0], args[1], args[2], args[3], object);
+-        return success ? 0 : -EINVAL;
+-    }
+-
+-    case KSU_SEPOLICY_CMD_TYPE_CHANGE:
+-        ret = sepol_require_not_all(args[0], "src");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-        ret = sepol_require_not_all(args[1], "tgt");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-        ret = sepol_require_not_all(args[2], "cls");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-        ret = sepol_require_not_all(args[3], "default_type");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-
+-        if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_CHANGE_CHANGE) {
+-            success = ksu_type_change(db, args[0], args[1], args[2], args[3]);
+-        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_CHANGE_MEMBER) {
+-            success = ksu_type_member(db, args[0], args[1], args[2], args[3]);
+-        } else {
+-            pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
+-        }
+-        return success ? 0 : -EINVAL;
+-
+-    case KSU_SEPOLICY_CMD_GENFSCON:
+-        ret = sepol_require_not_all(args[0], "name");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-        ret = sepol_require_not_all(args[1], "path");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-        ret = sepol_require_not_all(args[2], "context");
+-        if (ret < 0) {
+-            return ret;
+-        }
+-
+-        if (!ksu_genfscon(db, args[0], args[1], args[2])) {
+-            pr_err("sepol: %d failed.\n", header->cmd);
+-            return -EINVAL;
+-        }
+-        return 0;
+-
+-    default:
+-        pr_err("sepol: unknown cmd: %d\n", header->cmd);
+-        return -EINVAL;
+-    }
++	selinux_xfrm_notify_policyload();
+ }
+ 
+ int handle_sepolicy(void __user *user_data, u64 data_len)
+ {
+-    struct selinux_policy *pol, *old_pol;
+-    struct policydb *db;
+-    struct sepol_batch_cursor cursor;
+-    u8 *payload;
+-    int ret;
+-    int success_cmd_count;
+-    u32 cmd_index;
+-
+-    if (!user_data || !data_len) {
+-        return -EINVAL;
+-    }
+-
+-    if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE) {
+-        return -E2BIG;
+-    }
+-
+-    payload = kvmalloc((size_t)data_len, GFP_KERNEL);
+-    if (!payload) {
+-        return -ENOMEM;
+-    }
+-
+-    if (copy_from_user(payload, user_data, (size_t)data_len)) {
+-        ret = -EFAULT;
+-        goto out_free;
+-    }
+-
+-    if (!getenforce()) {
+-        pr_info("SELinux permissive or disabled when handle policy!\n");
+-    }
+-
+-    mutex_lock(&selinux_state.policy_mutex);
+-
+-    old_pol = selinux_state.policy;
+-    pol = ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
+-    if (IS_ERR(pol)) {
+-        ret = PTR_ERR(pol);
+-        pr_err("ksu_dup_sepolicy err: %d\n", ret);
+-        goto out_unlock;
+-    }
+-    db = &pol->policydb;
+-
+-    cursor.cur = payload;
+-    cursor.end = payload + (size_t)data_len;
+-
+-    ret = 0;
+-    success_cmd_count = 0;
+-    cmd_index = 0;
+-    while (cursor.cur < cursor.end) {
+-        struct sepol_data header;
+-        const char *args[KSU_SEPOLICY_MAX_ARGS] = { 0 };
+-        int expected_argc;
+-        u32 arg_index;
+-
+-        ret = sepol_read_cmd_header(&cursor, &header);
+-        if (ret < 0) {
+-            pr_err("sepol: failed to read cmd header #%u.\n", cmd_index);
+-            goto out_drop_new_policy;
+-        }
+-
+-        expected_argc = sepol_expected_argc(header.cmd);
+-        if (expected_argc < 0 || expected_argc > KSU_SEPOLICY_MAX_ARGS) {
+-            ret = -EINVAL;
+-            pr_err("sepol: invalid cmd header #%u.\n", cmd_index);
+-            goto out_drop_new_policy;
+-        }
+-
+-        for (arg_index = 0; arg_index < (u32)expected_argc; arg_index++) {
+-            ret = sepol_read_string(&cursor, &args[arg_index]);
+-            if (ret < 0) {
+-                pr_err("sepol: failed to read cmd #%u arg #%u.\n", cmd_index, arg_index);
+-                goto out_drop_new_policy;
+-            }
+-        }
+-
+-        ret = apply_one_sepolicy_cmd(db, &header, args);
+-        if (ret < 0) {
+-            pr_err("sepol: cmd #%u failed, cmd=%u subcmd=%u.\n", cmd_index, header.cmd, header.subcmd);
+-        } else {
+-            success_cmd_count++;
+-        }
+-        cmd_index++;
+-    }
+-
+-    rcu_assign_pointer(selinux_state.policy, pol);
+-    synchronize_rcu();
+-    ksu_destroy_sepolicy(old_pol);
+-
+-    reset_avc_cache();
+-    ret = success_cmd_count;
+-    goto out_unlock;
+-
+-out_drop_new_policy:
+-    ksu_destroy_sepolicy(pol);
+-out_unlock:
+-    mutex_unlock(&selinux_state.policy_mutex);
+-out_free:
+-    kvfree(payload);
+-
+-    return ret;
 +	if (!arg4) {
 +		return -1;
 +	}
@@ -958,374 +1343,208 @@
 +
 +	return ret;
  }
--
--#define KSU_SEPOLICY_MAX_BATCH_SIZE (8U * 1024U * 1024U)
--#define KSU_SEPOLICY_MAX_ARGS 5
--
--struct sepol_data {
--    u32 cmd;
--    u32 subcmd;
--};
--
--struct sepol_batch_cursor {
--    const u8 *cur;
--    const u8 *end;
--};
--
--static size_t sepol_remaining(const struct sepol_batch_cursor *cursor)
--{
--    return (size_t)(cursor->end - cursor->cur);
--}
--
--static int sepol_read_cmd_header(struct sepol_batch_cursor *cursor, struct sepol_data *header)
--{
--    if (sepol_remaining(cursor) < sizeof(*header)) {
--        return -EINVAL;
--    }
--
--    memcpy(header, cursor->cur, sizeof(*header));
--    cursor->cur += sizeof(*header);
--
--    return 0;
--}
--
--static int sepol_read_string(struct sepol_batch_cursor *cursor, const char **out)
--{
--    u32 len;
--    const char *str;
--
--    if (sepol_remaining(cursor) < sizeof(len)) {
--        return -EINVAL;
--    }
--
--    memcpy(&len, cursor->cur, sizeof(len));
--    cursor->cur += sizeof(len);
--
--    if (len >= sepol_remaining(cursor)) {
--        return -EINVAL;
--    }
--
--    str = (const char *)cursor->cur;
--    if (memchr(str, '\0', len) != NULL || str[len] != '\0') {
--        return -EINVAL;
--    }
--
--    cursor->cur += len + 1;
--    if (len == 0) {
--        *out = ALL;
--        return 0;
--    }
--
--    *out = str;
--    return 0;
--}
--
--static int sepol_require_not_all(const char *value, const char *name)
--{
--    if (value != ALL) {
--        return 0;
--    }
--
--    pr_err("sepol: %s cannot be ALL.\n", name);
--    return -EINVAL;
--}
--
--static int sepol_expected_argc(u32 cmd)
--{
--    switch (cmd) {
--    case KSU_SEPOLICY_CMD_NORMAL_PERM:
--        return 4;
--    case KSU_SEPOLICY_CMD_XPERM:
--        return 5;
--    case KSU_SEPOLICY_CMD_TYPE_STATE:
--        return 1;
--    case KSU_SEPOLICY_CMD_TYPE:
--    case KSU_SEPOLICY_CMD_TYPE_ATTR:
--        return 2;
--    case KSU_SEPOLICY_CMD_ATTR:
--        return 1;
--    case KSU_SEPOLICY_CMD_TYPE_TRANSITION:
--        return 5;
--    case KSU_SEPOLICY_CMD_TYPE_CHANGE:
--        return 4;
--    case KSU_SEPOLICY_CMD_GENFSCON:
--        return 3;
--    default:
--        return -EINVAL;
--    }
--}
--
--static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *header, const char **args)
--{
--    bool success = false;
--    int ret;
--
--    switch (header->cmd) {
--    case KSU_SEPOLICY_CMD_NORMAL_PERM:
--        if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_ALLOW) {
--            success = ksu_allow(db, args[0], args[1], args[2], args[3]);
--        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_DENY) {
--            success = ksu_deny(db, args[0], args[1], args[2], args[3]);
--        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_AUDITALLOW) {
--            success = ksu_auditallow(db, args[0], args[1], args[2], args[3]);
--        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_NORMAL_PERM_DONTAUDIT) {
--            success = ksu_dontaudit(db, args[0], args[1], args[2], args[3]);
--        } else {
--            pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
--        }
--        return success ? 0 : -EINVAL;
--
--    case KSU_SEPOLICY_CMD_XPERM:
--        ret = sepol_require_not_all(args[3], "operation");
--        if (ret < 0) {
--            return ret;
--        }
--        ret = sepol_require_not_all(args[4], "perm_set");
--        if (ret < 0) {
--            return ret;
--        }
--
--        if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_ALLOW) {
--            success = ksu_allowxperm(db, args[0], args[1], args[2], args[4]);
--        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_AUDITALLOW) {
--            success = ksu_auditallowxperm(db, args[0], args[1], args[2], args[4]);
--        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_XPERM_DONTAUDIT) {
--            success = ksu_dontauditxperm(db, args[0], args[1], args[2], args[4]);
--        } else {
--            pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
--        }
--        return success ? 0 : -EINVAL;
--
--    case KSU_SEPOLICY_CMD_TYPE_STATE:
--        ret = sepol_require_not_all(args[0], "type");
--        if (ret < 0) {
--            return ret;
--        }
--
--        if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_STATE_PERMISSIVE) {
--            success = ksu_permissive(db, args[0]);
--        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_STATE_ENFORCE) {
--            success = ksu_enforce(db, args[0]);
--        } else {
--            pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
--        }
--        return success ? 0 : -EINVAL;
--
--    case KSU_SEPOLICY_CMD_TYPE:
--    case KSU_SEPOLICY_CMD_TYPE_ATTR:
--        ret = sepol_require_not_all(args[0], "type");
--        if (ret < 0) {
--            return ret;
--        }
--        ret = sepol_require_not_all(args[1], "attribute");
--        if (ret < 0) {
--            return ret;
--        }
--
--        if (header->cmd == KSU_SEPOLICY_CMD_TYPE) {
--            success = ksu_type(db, args[0], args[1]);
--        } else {
--            success = ksu_typeattribute(db, args[0], args[1]);
--        }
--        if (!success) {
--            pr_err("sepol: %d failed.\n", header->cmd);
--            return -EINVAL;
--        }
--        return 0;
--
--    case KSU_SEPOLICY_CMD_ATTR:
--        ret = sepol_require_not_all(args[0], "attribute");
--        if (ret < 0) {
--            return ret;
--        }
--
--        if (!ksu_attribute(db, args[0])) {
--            pr_err("sepol: %d failed.\n", header->cmd);
--            return -EINVAL;
--        }
--        return 0;
--
--    case KSU_SEPOLICY_CMD_TYPE_TRANSITION: {
--        const char *object = ALL;
--
--        ret = sepol_require_not_all(args[0], "src");
--        if (ret < 0) {
--            return ret;
--        }
--        ret = sepol_require_not_all(args[1], "tgt");
--        if (ret < 0) {
--            return ret;
--        }
--        ret = sepol_require_not_all(args[2], "cls");
--        if (ret < 0) {
--            return ret;
--        }
--        ret = sepol_require_not_all(args[3], "default_type");
--        if (ret < 0) {
--            return ret;
--        }
--
--        object = args[4];
--
--        success = ksu_type_transition(db, args[0], args[1], args[2], args[3], object);
--        return success ? 0 : -EINVAL;
--    }
--
--    case KSU_SEPOLICY_CMD_TYPE_CHANGE:
--        ret = sepol_require_not_all(args[0], "src");
--        if (ret < 0) {
--            return ret;
--        }
--        ret = sepol_require_not_all(args[1], "tgt");
--        if (ret < 0) {
--            return ret;
--        }
--        ret = sepol_require_not_all(args[2], "cls");
--        if (ret < 0) {
--            return ret;
--        }
--        ret = sepol_require_not_all(args[3], "default_type");
--        if (ret < 0) {
--            return ret;
--        }
--
--        if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_CHANGE_CHANGE) {
--            success = ksu_type_change(db, args[0], args[1], args[2], args[3]);
--        } else if (header->subcmd == KSU_SEPOLICY_SUBCMD_TYPE_CHANGE_MEMBER) {
--            success = ksu_type_member(db, args[0], args[1], args[2], args[3]);
--        } else {
--            pr_err("sepol: unknown subcmd: %d\n", header->subcmd);
--        }
--        return success ? 0 : -EINVAL;
--
--    case KSU_SEPOLICY_CMD_GENFSCON:
--        ret = sepol_require_not_all(args[0], "name");
--        if (ret < 0) {
--            return ret;
--        }
--        ret = sepol_require_not_all(args[1], "path");
--        if (ret < 0) {
--            return ret;
--        }
--        ret = sepol_require_not_all(args[2], "context");
--        if (ret < 0) {
--            return ret;
--        }
--
--        if (!ksu_genfscon(db, args[0], args[1], args[2])) {
--            pr_err("sepol: %d failed.\n", header->cmd);
--            return -EINVAL;
--        }
--        return 0;
--
--    default:
--        pr_err("sepol: unknown cmd: %d\n", header->cmd);
--        return -EINVAL;
--    }
--}
--
--int handle_sepolicy(void __user *user_data, u64 data_len)
--{
--    struct selinux_policy *pol, *old_pol;
--    struct policydb *db;
--    struct sepol_batch_cursor cursor;
--    u8 *payload;
--    int ret;
--    int success_cmd_count;
--    u32 cmd_index;
--
--    if (!user_data || !data_len) {
--        return -EINVAL;
--    }
--
--    if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE) {
--        return -E2BIG;
--    }
--
--    payload = kvmalloc((size_t)data_len, GFP_KERNEL);
--    if (!payload) {
--        return -ENOMEM;
--    }
--
--    if (copy_from_user(payload, user_data, (size_t)data_len)) {
--        ret = -EFAULT;
--        goto out_free;
--    }
--
--    if (!getenforce()) {
--        pr_info("SELinux permissive or disabled when handle policy!\n");
--    }
--
--    mutex_lock(&selinux_state.policy_mutex);
--
--    old_pol = selinux_state.policy;
--    pol = ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
--    if (IS_ERR(pol)) {
--        ret = PTR_ERR(pol);
--        pr_err("ksu_dup_sepolicy err: %d\n", ret);
--        goto out_unlock;
--    }
--    db = &pol->policydb;
--
--    cursor.cur = payload;
--    cursor.end = payload + (size_t)data_len;
--
--    ret = 0;
--    success_cmd_count = 0;
--    cmd_index = 0;
--    while (cursor.cur < cursor.end) {
--        struct sepol_data header;
--        const char *args[KSU_SEPOLICY_MAX_ARGS] = { 0 };
--        int expected_argc;
--        u32 arg_index;
--
--        ret = sepol_read_cmd_header(&cursor, &header);
--        if (ret < 0) {
--            pr_err("sepol: failed to read cmd header #%u.\n", cmd_index);
--            goto out_drop_new_policy;
--        }
--
--        expected_argc = sepol_expected_argc(header.cmd);
--        if (expected_argc < 0 || expected_argc > KSU_SEPOLICY_MAX_ARGS) {
--            ret = -EINVAL;
--            pr_err("sepol: invalid cmd header #%u.\n", cmd_index);
--            goto out_drop_new_policy;
--        }
--
--        for (arg_index = 0; arg_index < (u32)expected_argc; arg_index++) {
--            ret = sepol_read_string(&cursor, &args[arg_index]);
--            if (ret < 0) {
--                pr_err("sepol: failed to read cmd #%u arg #%u.\n", cmd_index, arg_index);
--                goto out_drop_new_policy;
--            }
--        }
--
--        ret = apply_one_sepolicy_cmd(db, &header, args);
--        if (ret < 0) {
--            pr_err("sepol: cmd #%u failed, cmd=%u subcmd=%u.\n", cmd_index, header.cmd, header.subcmd);
--        } else {
--            success_cmd_count++;
--        }
--        cmd_index++;
--    }
--
--    rcu_assign_pointer(selinux_state.policy, pol);
--    synchronize_rcu();
--    ksu_destroy_sepolicy(old_pol);
--
--    reset_avc_cache();
--    ret = success_cmd_count;
--    goto out_unlock;
--
--out_drop_new_policy:
--    ksu_destroy_sepolicy(pol);
--out_unlock:
--    mutex_unlock(&selinux_state.policy_mutex);
--out_free:
--    kvfree(payload);
--
--    return ret;
--}
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -62,11 +62,11 @@
+ static write_op_fn *selinux_write_op;
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+-static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
++static int security_context_to_sid_with_policy(struct selinux_ss *policy, const char *scontext, u32 scontext_len,
+                                                u32 *sid, u32 def_sid, gfp_t gfp_flags);
+-static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
++static int security_sid_to_context_with_policy(struct selinux_ss *policy, u32 sid, char **scontext,
+                                                u32 *scontext_len);
+-static void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,
++static void security_compute_av_user_with_policy(struct selinux_ss *policy, u32 ssid, u32 tsid, u16 tclass,
+                                                  struct av_decision *avd);
+ static void (*security_dump_masked_av_fn)(struct policydb *policydb, struct context *scontext, struct context *tcontext,
+                                           u16 tclass, u32 permissions, const char *reason) = NULL;
+@@ -247,15 +247,15 @@
+ 
+ static void initialize_fake_status()
+ {
+-    mutex_lock(&selinux_state.status_lock);
++    mutex_lock(&selinux_state.ss->status_lock);
+     if (fake_status)
+         goto out;
+-    if (!selinux_state.status_page) {
++    if (!selinux_state.ss->status_page) {
+         pr_warn("initialize_fake_status: status_page not exist\n");
+         goto out;
+     }
+ 
+-    struct selinux_kernel_status *status = page_address(selinux_state.status_page);
++    struct selinux_kernel_status *status = page_address(selinux_state.ss->status_page);
+     if (!status->enforcing && !ksu_late_loaded) {
+         pr_warn("initialize_fake_status: skip not enforcing\n");
+         goto out;
+@@ -282,7 +282,7 @@
+             new_status->policyload, new_status->enforcing);
+ 
+ out:
+-    mutex_unlock(&selinux_state.status_lock);
++    mutex_unlock(&selinux_state.ss->status_lock);
+ }
+ 
+ typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
+@@ -291,9 +291,9 @@
+ {
+     if (likely(current_uid().val >= 10000 && ksu_selinux_hide_enabled)) {
+         void *data;
+-        mutex_lock(&selinux_state.status_lock);
++        mutex_lock(&selinux_state.ss->status_lock);
+         data = fake_status;
+-        mutex_unlock(&selinux_state.status_lock);
++        mutex_unlock(&selinux_state.ss->status_lock);
+         if (data) {
+             filp->private_data = data;
+             return 0;
+@@ -334,8 +334,9 @@
+         pr_warn("context_struct_compute_av not found!\n");
+     }
+ #else
+-    fake_state.initialized = true;
+-    fake_state.policy = backup_sepolicy;
++    /* 4.19 没有 selinux_state.policy —— policydb 在 selinux_state.ss 里,
++     * 而整份浅拷贝已经把 .ss 带过去了,不需要再单独指一次。 */
++    fake_state = selinux_state;
+ #endif
+ 
+     context_write = &selinux_write_op[SEL_CONTEXT];
+@@ -506,11 +507,11 @@
+     }
+     mutex_unlock(&selinux_hide_mutex);
+     ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
+-    mutex_lock(&selinux_state.status_lock);
++    mutex_lock(&selinux_state.ss->status_lock);
+     if (fake_status)
+         __free_page(fake_status);
+     fake_status = NULL;
+-    mutex_unlock(&selinux_state.status_lock);
++    mutex_unlock(&selinux_state.ss->status_lock);
+ }
+ 
+ void ksu_selinux_hide_drop_backup_if_unused()
+@@ -518,10 +519,15 @@
+     mutex_lock(&selinux_hide_mutex);
+     if (!ksu_selinux_hide_running && backup_sepolicy) {
+         pr_info("selinux_hide is not enabled - drop backup_sepolicy\n");
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
++        /* 5.x 上 backup_sepolicy 是自己深拷贝出来的一份,释放它是安全的。
++         * 4.19 上它就是 selinux_state.ss 本体 —— 释放它等于释放正在使用的
++         * SELinux 策略表,下一条 SELinux 检查就会踩已释放内存。整段不编。 */
+         sidtab_destroy(backup_sepolicy->sidtab);
+         kfree(backup_sepolicy->sidtab);
+         ksu_destroy_sepolicy(backup_sepolicy);
+         backup_sepolicy = NULL;
++#endif
+     }
+     mutex_unlock(&selinux_hide_mutex);
+ }
+@@ -605,7 +611,7 @@
+     return rc;
+ }
+ 
+-static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
++static int security_context_to_sid_with_policy(struct selinux_ss *policy, const char *scontext, u32 scontext_len,
+                                                u32 *sid, u32 def_sid, gfp_t gfp_flags)
+ {
+     struct policydb *policydb;
+@@ -712,7 +718,7 @@
+     return rc;
+ }
+ 
+-static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
++static int security_sid_to_context_with_policy(struct selinux_ss *policy, u32 sid, char **scontext,
+                                                u32 *scontext_len)
+ {
+     struct policydb *policydb;
+@@ -744,7 +750,7 @@
+     return rc;
+ }
+ 
+-static void avd_init(struct selinux_policy *policy, struct av_decision *avd)
++static void avd_init(struct selinux_ss *policy, struct av_decision *avd)
+ {
+     avd->allowed = 0;
+     avd->auditallow = 0;
+@@ -1085,7 +1091,7 @@
+     type_attribute_bounds_av(policydb, scontext, tcontext, tclass, avd);
+ }
+ 
+-static void __nocfi security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,
++static void __nocfi security_compute_av_user_with_policy(struct selinux_ss *policy, u32 ssid, u32 tsid, u16 tclass,
+                                                          struct av_decision *avd)
+ {
+     struct policydb *policydb;
+--- a/kernel/infra/file_wrapper.c
++++ b/kernel/infra/file_wrapper.c
+@@ -93,6 +93,7 @@
+     return orig->f_op->iopoll(kiocb, icb, v);
+ }
+ #else
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
+ static int ksu_wrapper_iopoll(struct kiocb *kiocb, bool spin)
+ {
+     struct ksu_file_wrapper *data = kiocb->ki_filp->private_data;
+@@ -100,6 +101,7 @@
+     kiocb->ki_filp = orig;
+     return orig->f_op->iopoll(kiocb, spin);
+ }
++#endif
+ #endif
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+@@ -307,6 +309,7 @@
+ // https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/remap_range.c;l=403-404;drc=398da7defe218d3e51b0f3bdff75147e28125b60
+ // REMAP_FILE_DEDUP: use file_out
+ // https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/remap_range.c;l=483-484;drc=398da7defe218d3e51b0f3bdff75147e28125b60
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+ static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,
+                                            loff_t len, unsigned int remap_flags)
+ {
+@@ -320,6 +323,7 @@
+         return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);
+     }
+ }
++#endif
+ 
+ static int ksu_wrapper_fadvise(struct file *fp, loff_t off1, loff_t off2, int flags)
+ {
+@@ -360,7 +364,9 @@
+     p->ops.write = fp->f_op->write ? ksu_wrapper_write : NULL;
+     p->ops.read_iter = fp->f_op->read_iter ? ksu_wrapper_read_iter : NULL;
+     p->ops.write_iter = fp->f_op->write_iter ? ksu_wrapper_write_iter : NULL;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
+     p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;
++#endif
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+     p->ops.iterate = fp->f_op->iterate ? ksu_wrapper_iterate : NULL;
+ #endif
+@@ -391,7 +397,9 @@
+     p->ops.fallocate = fp->f_op->fallocate ? ksu_wrapper_fallocate : NULL;
+     p->ops.show_fdinfo = fp->f_op->show_fdinfo ? ksu_wrapper_show_fdinfo : NULL;
+     p->ops.copy_file_range = fp->f_op->copy_file_range ? ksu_wrapper_copy_file_range : NULL;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+     p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;
++#endif
+     p->ops.fadvise = fp->f_op->fadvise ? ksu_wrapper_fadvise : NULL;
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+@@ -448,7 +456,12 @@
+     if (IS_ERR(inode))
+         return inode;
+     inode->i_flags &= ~S_PRIVATE;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
+     error = security_inode_init_security_anon(inode, &qname, context_inode);
++#else
++    /* 4.19 的签名是 (inode, mode, qstr, cred),没有 anon 专用那一支。 */
++    error = security_inode_init_security(inode, NULL, &qname, context_inode);
++#endif
+     if (error) {
+         iput(inode);
+         return ERR_PTR(error);
 --- a/kernel/selinux/sepolicy.c
 +++ b/kernel/selinux/sepolicy.c
 @@ -1,18 +1,12 @@
