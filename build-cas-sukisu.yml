@@ -89,7 +89,11 @@ jobs:
 
       - name: Report toolchain
         run: |
-          echo "SukiSU: ${SUKISU_REPO} @ ${SUKISU_REF}"
+          # 版本锁在 build_cas_sukisu.sh(本 workflow 故意不设 env 以免覆盖它)。
+          # 这里只把脚本里钉的值显示出来,不代表实际编了什么 ——
+          # 实际编到哪一版见后面 Verify 步骤 cat 出来的 dist/BUILD_INFO.txt,
+          # 那是脚本 checkout 后核对过真实 SHA 才落盘的。
+          grep -E '^SUKISU_(REPO|REF)=' build_cas_sukisu.sh || true
           echo "CLANG_BIN=$CLANG_BIN"
           $CLANG_BIN/clang --version
           aarch64-linux-gnu-ld --version | head -1
@@ -111,7 +115,11 @@ jobs:
           IMG=dist/Image_cas_sukisu
           test -f "$IMG" || { echo "❌ 没有产出 Image"; exit 1; }
           ls -la dist/
-          echo "$SUKISU_REPO @ $SUKISU_REF" >> "$GITHUB_STEP_SUMMARY"
+          # 构建凭据由脚本产出(它核对过实际 checkout 的 SHA),这里只读不推断。
+          # 自己 echo $SUKISU_REF 是推断不是事实 —— 那正是上次版本对不上的原因。
+          test -f dist/BUILD_INFO.txt || { echo "❌ 没有 dist/BUILD_INFO.txt"; exit 1; }
+          cat dist/BUILD_INFO.txt
+          cat dist/BUILD_INFO.txt >> "$GITHUB_STEP_SUMMARY"
 
           # 这里只用【字符串字面量】做判据,不去 strings 里找符号名。
           # arm64 的 kallsyms 符号名存在 kallsyms_names 里,是 deflate 压缩的,
@@ -146,4 +154,5 @@ jobs:
           path: |
             dist/Image_cas_sukisu
             dist/*.zip
+            dist/BUILD_INFO.txt
           retention-days: 30
