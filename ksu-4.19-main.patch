@@ -22,7 +22,7 @@
  # Keep a new line here!! Because someone may append config
 --- a/kernel/kernel_compat.h
 +++ b/kernel/kernel_compat.h
-@@ -1,8 +1,12 @@
+@@ -1,8 +1,111 @@
 -#ifndef __KSU_H_KERNEL_COMPAT
 -#define __KSU_H_KERNEL_COMPAT
 +#ifndef __KSU_KERNEL_COMPAT_H
@@ -34,13 +34,7 @@
 +/* -include 强制注入导致本文件先于 .c 的 #include 被处理,自己把底座拉进来。 */
 +#include <linux/uaccess.h>
 +#include <linux/errno.h>
- 
- /*
-  * ksu_copy_from_user_retry
-@@ -21,4 +25,86 @@
-     return copy_from_user(to, from, count);
- }
- 
++
 +/*
 + * ============================================================================
 + * 4.19 适配垫片
@@ -67,7 +61,7 @@
 +{
 +	return copy_from_user(to, from, n);
 +}
- #endif
++#endif
 +
 +#ifndef copy_to_user_nofault
 +static inline long copy_to_user_nofault(void __user *to, const void *from,
@@ -121,9 +115,27 @@
 +#define fallthrough
 +#endif
 +
++/*
++ * SECCOMP_ARCH_NATIVE_NR:5.x 的 seccomp 子系统拿它当【bitmap 的位数】用,
++ * 也就是 syscall 号的上界。infra/seccomp_cache.c 里是这么用的:
++ *     DECLARE_BITMAP(allow_native, SECCOMP_ARCH_NATIVE_NR);
++ *     if (nr >= 0 && nr < SECCOMP_ARCH_NATIVE_NR) set_bit(nr, ...);
++ * 4.19 的 include/uapi/linux/seccomp.h 里连 SECCOMP_ARCH_* 这一组都没有,
++ * 真正的 syscall 号上界在 <asm/unistd.h> 的 __NR_syscalls,拿它顶上。
++ *
++ * COMPAT 那一路不去定义:源文件是 #ifdef SECCOMP_ARCH_COMPAT 包着的,
++ * 不定义就整段跳过,32 位兼容路径在 arm64 上本来也不是这条逻辑要的。
++ */
++#ifndef SECCOMP_ARCH_NATIVE_NR
++#include <asm/unistd.h>
++#define SECCOMP_ARCH_NATIVE_NR __NR_syscalls
++#endif
++
 +#endif /* LINUX_VERSION_CODE < 5.8.0 */
 +
-+#endif
+ 
+ /*
+  * ksu_copy_from_user_retry
 --- a/kernel/kpm/kpm.c
 +++ b/kernel/kpm/kpm.c
 @@ -134,14 +134,14 @@
@@ -238,3 +250,15 @@
  #include <linux/uaccess.h>
  #include <asm/current.h>
  #include <linux/cred.h>
+--- a/kernel/infra/su_mount_ns.c
++++ b/kernel/infra/su_mount_ns.c
+@@ -13,7 +13,8 @@
+ #include <linux/syscalls.h>
+ #include <linux/task_work.h>
+ #include <linux/version.h>
+-#include <uapi/linux/mount.h>
++/* 4.19 没有 include/uapi/linux/mount.h,MS_* 这些标志在 <linux/mount.h>。 */
++#include <linux/mount.h>
+ 
+ #include "arch.h"
+ #include "klog.h" // IWYU pragma: keep
