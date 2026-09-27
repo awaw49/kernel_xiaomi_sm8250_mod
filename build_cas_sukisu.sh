@@ -128,6 +128,13 @@ fi
 # 而第一条 fatal 报在 1353。f4863b20 没这问题,因为它用一个 #ifdef
 # 把「声明 + if 整块」罩住了 —— 本 patch 就是把 329b7f59 改回那种写法。
 KSU_PATCH="${KSU_PATCH:-ksu-4.19-compat.patch}"
+# 必须转成绝对路径再往下走。`git -C KernelSU apply` 会让 git 按 KernelSU/
+# 解析相对路径,而补丁在仓库根目录 —— 于是上面 `[ -f "$KSU_PATCH" ]` 按脚本
+# cwd 检查说"在",git 紧接着却报 can't open patch。这个坑栽过一次。
+case "$KSU_PATCH" in
+    /*) ;;
+    *)  KSU_PATCH="$PWD/$KSU_PATCH" ;;
+esac
 if [ ! -f "$KSU_PATCH" ]; then
     echo "❌ 找不到兼容补丁 $KSU_PATCH(应与本脚本同目录)"
     exit 1
