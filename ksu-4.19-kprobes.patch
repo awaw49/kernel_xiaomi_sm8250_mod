@@ -216,3 +216,443 @@
  #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
  extern void susfs_try_umount_all(uid_t uid);
  void susfs_run_try_umount_for_current_mnt_ns(void) {
+--- a/security/selinux/Makefile
++++ b/security/selinux/Makefile
+@@ -5,7 +5,7 @@
+ 
+ obj-$(CONFIG_SECURITY_SELINUX) := selinux.o
+ 
+-selinux-y := avc.o hooks.o selinuxfs.o netlink.o nlmsgtab.o netif.o \
++selinux-y := avc.o hooks.o selinuxfs.o netlink.o nlmsgtab.o netif.o clean_view.o \
+ 	     netnode.o netport.o exports.o\
+ 	     ss/ebitmap.o ss/hashtab.o ss/symtab.o ss/sidtab.o ss/avtab.o \
+ 	     ss/policydb.o ss/services.o ss/conditional.o ss/mls.o ss/status.o
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -41,6 +41,7 @@
+ #include "security.h"
+ #include "objsec.h"
+ #include "conditional.h"
++#include "clean_view.h"
+ 
+ enum sel_inos {
+ 	SEL_ROOT_INO = 2,
+@@ -397,15 +398,25 @@
+ 	if (!plm)
+ 		goto err;
+ 
+-	if (i_size_read(inode) != security_policydb_len(state)) {
+-		inode_lock(inode);
+-		i_size_write(inode, security_policydb_len(state));
+-		inode_unlock(inode);
+-	}
+-
+-	rc = security_read_policy(state, &plm->data, &plm->len);
++	/* 有干净视图就交快照的 blob。拿不到(没就绪/分配失败)就退回真实策略,
++	 * 行为和原来完全一样 —— 隐藏失败不能变成功能不可用。 */
++	if (selinux_clean_view_ready())
++		rc = selinux_clean_view_get_policy(&plm->data, &plm->len);
++	else
++		rc = -EAGAIN;
++	if (rc == -EAGAIN)
++		rc = security_read_policy(state, &plm->data, &plm->len);
+ 	if (rc)
+ 		goto err;
++
++	/* 大小按实际拿到的数据算,不用 security_policydb_len() —— 真实策略
++	 * 已经被 KSU 注入过规则,比快照大,按真实长度写会把"策略变大了"漏给
++	 * stat()。没开隐藏时 plm->len 就等于 security_policydb_len(),行为不变。 */
++	if (i_size_read(inode) != plm->len) {
++		inode_lock(inode);
++		i_size_write(inode, plm->len);
++		inode_unlock(inode);
++	}
+ 
+ 	fsi->policy_opened = 1;
+ 
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@ -62,6 +62,7 @@
+ #include "policydb.h"
+ #include "sidtab.h"
+ #include "services.h"
++#include "clean_view.h"
+ #include "conditional.h"
+ #include "mls.h"
+ #include "objsec.h"
+@@ -1214,6 +1215,85 @@
+ }
+ 
+ /*
++ * 干净策略视图的查询入口。
++ *
++ * 这个包装必须留在这个文件里:context_struct_compute_av() 是 static,而
++ * context_struct_compute_av() 那套 avtab 遍历(类型/属性双向匹配、neverallow、
++ * 条件表达式、MLS 范围)有一百多行,复制一份出来只会随上游演进腐化。状态和锁
++ * 在 clean_view.c,那边通过 selinux_clean_view_db() 交出稳定指针。
++ *
++ * 语义上是 security_compute_av_user() 的"用快照算一遍"版本,逐行对照着写:
++ *   - SID 走真实 sidtab(快照里没有 SID 表,也不该有)
++ *   - 权限判定走快照的 avtab
++ *   - permissive 位走快照的 permissive_map —— KSU 会把自己的域塞进真实策略的
++ *     permissive_map,那正是要藏的东西之一,所以必须看快照
++ *   - latest_granting 在 4.19 上挂在 struct selinux_ss 上而不是 policydb 上,
++ *     快照带不出来,只能继续用真实值。这不构成泄漏:sel_write_access() 只
++ *     snprintf 出 allowed/auditdeny,seqno 根本不出现在 /sys/fs/selinux/access
++ *     的响应里。
++ *
++ * 那个越界检查不是防御性编程,是必需的。KSU 注入规则时新增的 type 和 class
++ * 索引大于快照的 nprim,而 context_struct_compute_av() 开头就是:
++ *     sattr = flex_array_get(policydb->type_attr_map_array, scontext->type - 1);
++ *     BUG_ON(!sattr);
++ * 越界就是 NULL,就是 BUG_ON,就是 oops —— 手机变砖。所以宁可返回 -EINVAL
++ * 让调用方退回真实策略,也不能崩在这里。
++ */
++int selinux_clean_view_compute(u32 ssid, u32 tsid, u16 tclass,
++			       struct av_decision *avd)
++{
++	struct selinux_state *state = &selinux_state;
++	struct policydb *db;
++	struct context *scontext, *tcontext;
++	int ret = -EINVAL;
++
++	db = selinux_clean_view_db();
++	if (!db || !state->ss)
++		return -EAGAIN;
++	if (!state->initialized)
++		return -EOPNOTSUPP;
++
++	read_lock(&state->ss->policy_rwlock);
++
++	scontext = sidtab_search(state->ss->sidtab, ssid);
++	tcontext = sidtab_search(state->ss->sidtab, tsid);
++	if (!scontext || !tcontext)
++		goto out;
++
++	/* 快照里没有外部注入方新增的 type/class/role/user,越界会 BUG_ON。 */
++	if (scontext->type > db->p_types.nprim ||
++	    tcontext->type > db->p_types.nprim ||
++	    scontext->role > db->p_roles.nprim ||
++	    tcontext->role > db->p_roles.nprim ||
++	    scontext->user > db->p_users.nprim ||
++	    tcontext->user > db->p_users.nprim)
++		goto out;
++
++	/* 和 avd_init() 逐字段一致,只有 latest_granting 只能沿用真实值(见上)。 */
++	avd->allowed = 0;
++	avd->auditallow = 0;
++	avd->auditdeny = 0xffffffff;
++	avd->seqno = state->ss->latest_granting;
++	avd->flags = 0;
++
++	if (!tclass)
++		goto out;
++	if (tclass > db->p_classes.nprim)
++		goto out;
++
++	/* permissive 位看快照,不看真实策略。 */
++	if (ebitmap_get_bit(&db->permissive_map, scontext->type))
++		avd->flags |= AVD_FLAGS_PERMISSIVE;
++
++	context_struct_compute_av(db, scontext, tcontext, tclass, avd, NULL);
++	ret = 0;
++out:
++	read_unlock(&state->ss->policy_rwlock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(selinux_clean_view_compute);
++
++/*
+  * Write the security context string representation of
+  * the context structure `context' into a dynamically
+  * allocated string of the correct size.  Set `*scontext'
+--- /dev/null
++++ b/security/selinux/include/clean_view.h
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * 干净策略视图 —— 4.19 上给 SELinux 补的"策略快照"能力。
++ *
++ * 用途:KSU 往运行中的策略里注入规则之后,外部通过 /sys/fs/selinux/access
++ * 查询、以及直接读 /sys/fs/selinux/policy,都能看到多出来的 type 和规则。
++ * 这个接口让调用方在注入【之前】抓一份原厂策略,之后用快照回答查询。
++ *
++ * 快照是重新解析出来的独立 policydb,不是指针拷贝;任何时候改真实策略都影响
++ * 不到它。实现见 security/selinux/clean_view.c。
++ *
++ * 本头文件在 security/selinux/ 之外也可见(ccflags-y 里有 -I.../include),
++ * 所以刻意不引用 struct policydb 的定义 —— 那个类型出了 security/selinux/
++ * 就看不见,这里只前置声明一个不透明指针。
++ */
++#ifndef _SELINUX_CLEAN_VIEW_H
++#define _SELINUX_CLEAN_VIEW_H
++
++#include <linux/types.h>
++#include <linux/errno.h>
++
++struct av_decision;
++struct policydb;
++
++#ifdef CONFIG_SECURITY_SELINUX
++
++/*
++ * 抓一份当前策略存成干净视图。必须在任何规则注入之前调用 —— 此刻导出的才是
++ * 原厂策略。重复调用是幂等的(第二次直接返回 0,不覆盖已有快照)。
++ *
++ * 返回 0 成功,负值失败;没开 SELinux 时返回 -EOPNOTSUPP。
++ */
++int selinux_clean_view_enable(void);
++
++/* 快照是否就绪。没就绪时调用方应当退回真实策略,而不是假装查询失败。 */
++bool selinux_clean_view_ready(void);
++
++/*
++ * 用快照算一次访问判定。SID 仍然走【真实】sidtab 解析(快照里没有 SID 表,
++ * 也不该有),但权限判定走快照的 avtab。
++ *
++ * 返回 0 并填好 avd;返回 -EAGAIN 表示快照没就绪、-EINVAL 表示这组 SID 或
++ * class 在原厂策略里不存在(KSU 注入的新 type 就是这种情况)—— 调用方在
++ * 这两种情况下应当退回真实策略,而不是报错。
++ *
++ * 注意这个函数【不能】替代真实判定来做实际 enforcement,只能用于回答外部
++ * 查询。它返回的 avd.auditdeny 等字段照样要按原样交给用户态。
++ */
++int selinux_clean_view_compute(u32 ssid, u32 tsid, u16 tclass,
++			       struct av_decision *avd);
++
++/*
++ * 以下两个只给 security/selinux/ 内部用(KSU 用不到),但必须留在头文件里 ——
++ * 定义在 clean_view.c,调用方分别是 ss/services.c 和 selinuxfs.c,不同编译单元。
++ *
++ * 返回的 policydb 指针在 enable() 之后既不改指向也不释放,调用方不需要持锁。
++ */
++struct policydb *selinux_clean_view_db(void);
++int selinux_clean_view_get_policy(void **data, size_t *len);
++
++#else /* !CONFIG_SECURITY_SELINUX */
++
++static inline int selinux_clean_view_enable(void)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline bool selinux_clean_view_ready(void)
++{
++	return false;
++}
++
++static inline int selinux_clean_view_compute(u32 ssid, u32 tsid, u16 tclass,
++					      struct av_decision *avd)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline struct policydb *selinux_clean_view_db(void)
++{
++	return NULL;
++}
++
++static inline int selinux_clean_view_get_policy(void **data, size_t *len)
++{
++	return -EOPNOTSUPP;
++}
++
++#endif /* CONFIG_SECURITY_SELINUX */
++
++#endif /* _SELINUX_CLEAN_VIEW_H */
+--- /dev/null
++++ b/security/selinux/clean_view.c
+@@ -0,0 +1,193 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * 干净策略视图 —— 捕获侧。
++ *
++ * 为什么必须是"导出 + 重新解析"而不是"拷贝一份 policydb":
++ *   struct policydb 里有 15 个左右指针字段(sym_val_to_name[SYM_NUM]、
++ *   class_val_to_struct、type_val_to_struct_array、type_attr_map_array、
++ *   filename_trans、te_cond_avtab、range_tr、genfs、ocontexts[OCON_NUM] …),
++ *   真正持有数据的是 flex_array 和 hashtab。规则注入路径 ksu_type()() 在把
++ *   type_attr_map_array / type_val_to_struct_array / sym_val_to_name[SYM_TYPES]
++ *   三个指针换到新对象之后,会对旧对象调 flex_array_free()。浅拷贝出来的这三块
++ *   和真实策略是同一块内存 —— 注入规则的那一刻就是 UAF,不是"有风险"。
++ *
++ *   而 security_read_policy() + policydb_read() 这条路是内核自己的序列化器和
++ *   解析器,走的是 kernel→kernel 的内存,不经过用户态。policydb_init() 先
++ *   memset 整个结构,再把 symtab / avtab / roles / cond_policydb / hashtab /
++ *   ebitmap 全部自己分配一遍,得到的 policydb 完全自洽,和真实策略零共享。
++ *   4.19 上这两个接口都是稳定的,policydb_read() 只做顺序读(内核格式),
++ *   不碰用户内存。
++ *
++ * 生命周期:快照在开机时抓一次,之后永久只读 —— clean_view_db 一旦发布就不再
++ * 改指向,也不释放。所以调用方拿到指针后不需要持锁,也不必担心失效。
++ * 代价是这份策略常驻内存(Mi 10 Ultra 上大约几百 KB 到 1 MB 多),换来的是
++ * 外部查询永远看不到后续注入。
++ */
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/mutex.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/compiler.h>
++
++#include "security.h"
++#include "clean_view.h"
++#include "ss/policydb.h"
++
++/* 干净策略自己的 policydb。见文件头:重新解析出来的,和真实策略零共享。 */
++static struct policydb *clean_view_db;
++
++/*
++ * 原厂策略的二进制导出,长期持有。
++ *
++ * security_read_policy() 返回的是 vmalloc_user 缓冲,而 selinuxfs 的
++ * sel_release_policy() 会对 plm->data 调 vfree() —— 所有权会打架。所以这里
++ * 换一份普通 vmalloc 的副本长期持有,和 selinuxfs 之间只走拷���。
++ *
++ * 它只被内核读(喂给 policydb_read),从不上映射给用户态,所以用 vmalloc
++ * 而不是 vmalloc_user 就够了。
++ */
++static void *clean_view_blob;
++static size_t clean_view_blob_len;
++
++/*
++ * 快照是否可用的发布标志。
++ *
++ * 写入只有 enable() 一处,而且是开机单线程;读的是 selinuxfs 的查询路径。
++ * 用 release/acquire 发布:看到 live==true 的读者一定能看到先写的 clean_view_db,
++ * 不会拿到"标志已置位但指针还是 NULL"的中间状态。
++ */
++static bool clean_view_live;
++
++static DEFINE_MUTEX(clean_view_lock);
++
++bool selinux_clean_view_ready(void)
++{
++	return smp_load_acquire(&clean_view_live);
++}
++EXPORT_SYMBOL_GPL(selinux_clean_view_ready);
++
++/*
++ * 抓一份当前策略。必须在 KSU 注入任何规则之前调用。
++ */
++int selinux_clean_view_enable(void)
++{
++	struct policy_file fp;
++	struct policydb *db;
++	void *blob, *kblob;
++	size_t len = 0;
++	int rc;
++
++	if (smp_load_acquire(&clean_view_live))
++		return 0;
++
++	/* 刻意不调 selinux_is_enabled():它在整棵树里只有 exports.c 里的定义,
++	 * include/security.h 没有给原型,调它就是隐式声明当 int 用,而实际返回
++	 * 类型是 bool。真正需要的"策略有没有初始化"判断,security_read_policy()
++	 * 开头自己就有(selinux_state.initialized 为假时返回 -EINVAL),直接让
++	 * 它判。 */
++	rc = security_read_policy(&selinux_state, &blob, &len);
++	if (rc)
++		return rc;
++	if (!blob || !len) {
++		vfree(blob);
++		return -EINVAL;
++	}
++
++	kblob = vmalloc(len);
++	if (!kblob) {
++		vfree(blob);
++		return -ENOMEM;
++	}
++	memcpy(kblob, blob, len);
++	vfree(blob);
++
++	db = kzalloc(sizeof(*db), GFP_KERNEL);
++	if (!db) {
++		vfree(kblob);
++		return -ENOMEM;
++	}
++
++	/*
++	 * policydb_read() 失败时,解析到一半已经分配出去的东西都挂在 db 上,
++	 * 必须走 policydb_destroy() 递归回收,直接 kfree 会漏一堆内存。
++	 * policydb_init() 是它内部调的,成功路径不用我们再初始化一次。
++	 */
++	fp.data = kblob;
++	fp.len = len;
++	rc = policydb_read(db, &fp);
++	if (rc) {
++		policydb_destroy(db);
++		kfree(db);
++		vfree(kblob);
++		return rc;
++	}
++
++	mutex_lock(&clean_view_lock);
++	if (clean_view_live) {
++		/* 并发的第二次调用:别人已经抓好了,丢掉自己这份。 */
++		mutex_unlock(&clean_view_lock);
++		policydb_destroy(db);
++		kfree(db);
++		vfree(kblob);
++		return 0;
++	}
++	clean_view_db = db;
++	clean_view_blob = kblob;
++	clean_view_blob_len = len;
++	/* release:上面三个指针的写必须先于 live 的写对读者可见。 */
++	smp_store_release(&clean_view_live, true);
++	mutex_unlock(&clean_view_lock);
++
++	pr_info("selinux: clean view captured: %zu bytes, %u types, %u classes, %u roles\n",
++		len, db->p_types.nprim, db->p_classes.nprim, db->p_roles.nprim);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(selinux_clean_view_enable);
++
++/*
++ * 给 ss/services.c 里的 selinux_clean_view_compute() 用。
++ *
++ * 不把 clean_view_db 做成非静态全局,是因为 struct policydb 在
++ * security/selinux/ 之外不可见,让外面的代码能直接持有这个类型的指针等于
++ * 把内核内部布局漏出去。compute() 被 static 的 context_struct_compute_av()
++ * 锁死在 services.c 里,而状态在这边 —— 这个窄接口就是这两者之间唯一的缝。
++ *
++ * 返回的是稳定指针:enable() 之后既不改指向也不释放,调用方不用持锁。
++ */
++struct policydb *selinux_clean_view_db(void)
++{
++	if (!smp_load_acquire(&clean_view_live))
++		return NULL;
++	return READ_ONCE(clean_view_db);
++}
++
++/*
++ * 给 selinuxfs 的 /sys/fs/selinux/policy 用:拿一份快照的拷贝。
++ *
++ * 必须拷 —— sel_release_policy() 会对 plm->data 做 vfree(),直接把长期持有的
++ * 指针交出去,用户态一次 close() 就把快照 free 掉了,第二次 open() 是 UAF。
++ *
++ * 拷贝用 vmalloc_user 而不是 vmalloc:这份缓冲会被 remap_vmalloc_range() 映射
++ * 进用户态,和 security_read_policy() 原本产出的缓冲性质保持一致。
++ *
++ * 返回 0 成功;快照没就绪返回 -EAGAIN,调用方退回 security_read_policy()。
++ */
++int selinux_clean_view_get_policy(void **data, size_t *len)
++{
++	void *buf;
++
++	if (!smp_load_acquire(&clean_view_live))
++		return -EAGAIN;
++
++	buf = vmalloc_user(clean_view_blob_len);
++	if (!buf)
++		return -ENOMEM;
++	memcpy(buf, clean_view_blob, clean_view_blob_len);
++
++	*data = buf;
++	*len = clean_view_blob_len;
++	return 0;
++}

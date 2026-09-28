@@ -1,19 +1,3 @@
-  ✅ kernel/Kbuild  +7 -0
-  ✅ kernel/kernel_compat.h  +132 -2
-  ✅ kernel/kpm/kpm.c  +13 -13
-  ✅ kernel/core/init.c  +3 -5
-  ✅ kernel/feature/sucompat.c  +2 -1
-  ✅ kernel/infra/su_mount_ns.c  +2 -1
-  ✅ kernel/selinux/rules.c  +523 -510
-  ✅ kernel/feature/selinux_hide.c  +26 -17
-  ✅ kernel/infra/file_wrapper.c  +19 -0
-  ✅ kernel/selinux/sepolicy.c  +955 -860
-  ✅ kernel/selinux/sepolicy.h  +0 -2
-  ✅ kernel/policy/allowlist.c  +1 -0
-  ✅ kernel/policy/app_profile.c  +6 -0
-  ✅ kernel/manager/pkg_observer.c  +13 -4
-  ✅ kernel/supercall/dispatch.c  +2 -0
-  ✅ kernel/sulog/event.c  +1 -1
 --- a/kernel/Kbuild
 +++ b/kernel/Kbuild
 @@ -82,6 +82,10 @@
@@ -1366,7 +1350,19 @@
  }
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -62,11 +62,11 @@
+@@ -20,6 +20,11 @@
+ #include <ss/services.h>
+ #include <ss/mls.h>
+ #include <ss/conditional.h>
++#include <linux/version.h>
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
++/* 4.19 适配:干净策略视图,内核侧 security/selinux/clean_view.c 提供。 */
++#include <clean_view.h>
++#endif
+ #include "avc.h"
+ #include "klog.h" // IWYU pragma: keep
+ #include "linux/kallsyms.h"
+@@ -62,11 +67,11 @@
  static write_op_fn *selinux_write_op;
  
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
@@ -1381,7 +1377,27 @@
                                                   struct av_decision *avd);
  static void (*security_dump_masked_av_fn)(struct policydb *policydb, struct context *scontext, struct context *tcontext,
                                            u16 tclass, u32 permissions, const char *reason) = NULL;
-@@ -247,15 +247,15 @@
+@@ -177,15 +182,16 @@
+ 
+     security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, &avd);
+ #else
+-    length = security_context_str_to_sid(&fake_state, scon, &ssid, GFP_KERNEL);
++    length = security_context_str_to_sid(&selinux_state, scon, &ssid, GFP_KERNEL);
+     if (length)
+         goto out;
+ 
+-    length = security_context_str_to_sid(&fake_state, tcon, &tsid, GFP_KERNEL);
++    length = security_context_str_to_sid(&selinux_state, tcon, &tsid, GFP_KERNEL);
+     if (length)
+         goto out;
+ 
+-    security_compute_av_user(&fake_state, ssid, tsid, tclass, &avd);
++    if (selinux_clean_view_compute(ssid, tsid, tclass, &avd))
++        security_compute_av_user(&selinux_state, ssid, tsid, tclass, &avd);
+ #endif
+ 
+     length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x", avd.allowed, 0xffffffff, avd.auditallow,
+@@ -247,15 +253,15 @@
  
  static void initialize_fake_status()
  {
@@ -1400,7 +1416,7 @@
      if (!status->enforcing && !ksu_late_loaded) {
          pr_warn("initialize_fake_status: skip not enforcing\n");
          goto out;
-@@ -282,7 +282,7 @@
+@@ -282,7 +288,7 @@
              new_status->policyload, new_status->enforcing);
  
  out:
@@ -1409,7 +1425,7 @@
  }
  
  typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
-@@ -291,9 +291,9 @@
+@@ -291,9 +297,9 @@
  {
      if (likely(current_uid().val >= 10000 && ksu_selinux_hide_enabled)) {
          void *data;
@@ -1421,7 +1437,7 @@
          if (data) {
              filp->private_data = data;
              return 0;
-@@ -313,10 +313,12 @@
+@@ -313,10 +319,12 @@
  {
      int ret;
      pr_info("selinux_hide: init selinux hide\n");
@@ -1434,19 +1450,44 @@
      selinux_write_op = find_kernel_symbol_exact("write_op");
      if (!selinux_write_op) {
          pr_err("selinux_hide: no write_op found!\n");
-@@ -334,8 +336,9 @@
+@@ -334,8 +342,16 @@
          pr_warn("context_struct_compute_av not found!\n");
      }
  #else
 -    fake_state.initialized = true;
 -    fake_state.policy = backup_sepolicy;
 +    /* 4.19 没有 selinux_state.policy —— policydb 在 selinux_state.ss 里,
-+     * 而整份浅拷贝已经把 .ss 带过去了,不需要再单独指一次。 */
++     * 而整份浅拷贝已经把 .ss 带过去了,不需要再单独指一次。
++     *
++     * 注意这份浅拷贝现在只服务 my_write_context() / my_setprocattr() 这两个
++     * 本次没做的出口 —— 它们共享同一个 ss 指针,行为和不隐藏时完全一样。
++     * 真正生效的是 my_write_access() 走内核侧的干净视图。 */
 +    fake_state = selinux_state;
++
++    if (!selinux_clean_view_ready())
++        pr_err("selinux_hide: clean policy view not ready, hiding is a no-op!\n");
  #endif
  
      context_write = &selinux_write_op[SEL_CONTEXT];
-@@ -506,15 +509,20 @@
+@@ -445,6 +461,17 @@
+ 
+ void ksu_selinux_hide_handle_second_stage()
+ {
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
++    /* 4.19:趁策略还干净,抓一份原厂策略下来。
++     *
++     * 为什么必须放在这里而不是 hide 的 enable() 里:enable() 是用户在管理器
++     * 里点开关时才走的,那时候 apply_kernelsu_rules() 早跑完了,策略里已经
++     * 有 KSU 的 type 和规则,再抓等于抓了个寂寞。5.x 上不存在这个问题,那边
++     * 的快照由 ksu_dup_sepolicy() 在换掉策略之前做掉。
++     */
++    if (selinux_clean_view_enable())
++        pr_err("selinux_hide: failed to capture clean policy view, hiding is off\n");
++#endif
+     initialize_fake_status();
+     // https://github.com/torvalds/linux/blame/e8c2f9fdadee7cbc75134dc463c1e0d856d6e5c7/security/selinux/selinuxfs.c#L2014
+     if (fake_status) {
+@@ -506,15 +533,20 @@
      }
      mutex_unlock(&selinux_hide_mutex);
      ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
@@ -1469,7 +1510,7 @@
      mutex_lock(&selinux_hide_mutex);
      if (!ksu_selinux_hide_running && backup_sepolicy) {
          pr_info("selinux_hide is not enabled - drop backup_sepolicy\n");
-@@ -524,6 +532,7 @@
+@@ -524,6 +556,7 @@
          backup_sepolicy = NULL;
      }
      mutex_unlock(&selinux_hide_mutex);
@@ -1477,7 +1518,7 @@
  }
  
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-@@ -605,7 +614,7 @@
+@@ -605,7 +638,7 @@
      return rc;
  }
  
@@ -1486,7 +1527,7 @@
                                                 u32 *sid, u32 def_sid, gfp_t gfp_flags)
  {
      struct policydb *policydb;
-@@ -712,7 +721,7 @@
+@@ -712,7 +745,7 @@
      return rc;
  }
  
@@ -1495,7 +1536,7 @@
                                                 u32 *scontext_len)
  {
      struct policydb *policydb;
-@@ -744,7 +753,7 @@
+@@ -744,7 +777,7 @@
      return rc;
  }
  
@@ -1504,7 +1545,7 @@
  {
      avd->allowed = 0;
      avd->auditallow = 0;
-@@ -1085,7 +1094,7 @@
+@@ -1085,7 +1118,7 @@
      type_attribute_bounds_av(policydb, scontext, tcontext, tclass, avd);
  }
  
