@@ -280,7 +280,7 @@
  #include "conditional.h"
  #include "mls.h"
  #include "objsec.h"
-@@ -1214,6 +1215,85 @@
+@@ -1214,6 +1215,94 @@
  }
  
  /*
@@ -296,10 +296,9 @@
 + *   - 权限判定走快照的 avtab
 + *   - permissive 位走快照的 permissive_map —— KSU 会把自己的域塞进真实策略的
 + *     permissive_map,那正是要藏的东西之一,所以必须看快照
-+ *   - latest_granting 在 4.19 上挂在 struct selinux_ss 上而不是 policydb 上,
-+ *     快照带不出来,只能继续用真实值。这不构成泄漏:sel_write_access() 只
-+ *     snprintf 出 allowed/auditdeny,seqno 根本不出现在 /sys/fs/selinux/access
-+ *     的响应里。
++ *   - seqno 走捕获时抄下的那个值,不是真实值 —— KSU 每注入一次规则就把
++ *     latest_granting 加一,而 sel_write_access() 是原样把它打印出去的,用
++ *     真实值等于把"这台机器上的策略被改过"印在每次查询的响应里
 + *
 + * 那个越界检查不是防御性编程,是必需的。KSU 注入规则时新增的 type 和 class
 + * 索引大于快照的 nprim,而 context_struct_compute_av() 开头就是:
@@ -316,13 +315,23 @@
 +	struct context *scontext, *tcontext;
 +	int ret = -EINVAL;
 +
-+	db = selinux_clean_view_db();
-+	if (!db || !state->ss)
++	if (!state->ss)
 +		return -EAGAIN;
 +	if (!state->initialized)
 +		return -EOPNOTSUPP;
 +
++	/*
++	 * 读锁必须先于取指针。快照会被 selinux_clean_view_disable() 释放,而
++	 * 那个函数拿的是同一把锁的写锁 —— 先加锁就保证解引用期间它一定还在。
++	 * 反过来(先 db() 再加锁)中间有个窗口:live 为真、指针已取到,紧接着
++	 * 释放方拿写锁销毁,这里就解引用了已释放内存。
++	 */
 +	read_lock(&state->ss->policy_rwlock);
++	db = selinux_clean_view_db();
++	if (!db) {
++		read_unlock(&state->ss->policy_rwlock);
++		return -EAGAIN;
++	}
 +
 +	scontext = sidtab_search(state->ss->sidtab, ssid);
 +	tcontext = sidtab_search(state->ss->sidtab, tsid);
@@ -338,11 +347,11 @@
 +	    tcontext->user > db->p_users.nprim)
 +		goto out;
 +
-+	/* 和 avd_init() 逐字段一致,只有 latest_granting 只能沿用真实值(见上)。 */
++	/* 和 avd_init() 逐字段一致,只有 seqno 取捕获时的值(见文件头)。 */
 +	avd->allowed = 0;
 +	avd->auditallow = 0;
 +	avd->auditdeny = 0xffffffff;
-+	avd->seqno = state->ss->latest_granting;
++	avd->seqno = selinux_clean_view_seqno();
 +	avd->flags = 0;
 +
 +	if (!tclass)
@@ -368,7 +377,7 @@
   * allocated string of the correct size.  Set `*scontext'
 --- /dev/null
 +++ b/security/selinux/include/clean_view.h
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,133 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * 干净策略视图 —— 4.19 上给 SELinux 补的"策略快照"能力。
@@ -421,10 +430,30 @@
 +			       struct av_decision *avd);
 +
 +/*
-+ * 以下两个只给 security/selinux/ 内部用(KSU 用不到),但必须留在头文件里 ——
++ * 释放快照,把内存还给系统。用于对齐上游"特性没启用就丢掉备份策略"的行为。
++ *
++ * 之所以必须实现:enable() 在快照不存在时会拒绝(返回 -EAGAIN),所以"启用前
++ * 把快照释放掉"是特性能自洽的前提,不是可选优化。
++ *
++ * 销毁和所有读路径共用 ss->policy_rwlock,调用方不需要额外持锁,但【不能】在
++ * 持有这把锁的情况下调它(会自死锁)。
++ */
++void selinux_clean_view_disable(void);
++
++/*
++ * 捕获时刻的 avd.seqno。快照没就绪时返回 0。
++ *
++ * 单独暴露是因为 4.19 把 latest_granting 挂在 selinux_ss 上,快照带不出来,
++ * 必须在捕获时另外抄一份。用真实值的话,KSU 每注入一次规则这个计数就 +1,
++ * 而 sel_write_access() 会把它原样打印给用户态。
++ */
++u32 selinux_clean_view_seqno(void);
++
++/*
++ * 以下这些只给 security/selinux/ 内部用(KSU 用不到),但必须留在头文件里 ——
 + * 定义在 clean_view.c,调用方分别是 ss/services.c 和 selinuxfs.c,不同编译单元。
 + *
-+ * 返回的 policydb 指针在 enable() 之后既不改指向也不释放,调用方不需要持锁。
++ * 返回的 policydb 指针在快照存活期间稳定不变,调用方不需要为它自己加锁。
 + */
 +struct policydb *selinux_clean_view_db(void);
 +int selinux_clean_view_get_policy(void **data, size_t *len);
@@ -455,6 +484,15 @@
 +	return -EOPNOTSUPP;
 +}
 +
++static inline void selinux_clean_view_disable(void)
++{
++}
++
++static inline u32 selinux_clean_view_seqno(void)
++{
++	return 0;
++}
++
 +static inline struct policydb *selinux_clean_view_db(void)
 +{
 +	return NULL;
@@ -475,7 +513,7 @@
 +#endif /* _SELINUX_CLEAN_VIEW_H */
 --- /dev/null
 +++ b/security/selinux/clean_view.c
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,332 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * 干净策略视图 —— 捕获侧。
@@ -496,10 +534,21 @@
 + *   4.19 上这两个接口都是稳定的,policydb_read() 只做顺序读(内核格式),
 + *   不碰用户内存。
 + *
-+ * 生命周期:快照在开机时抓一次,之后永久只读 —— clean_view_db 一旦发布就不再
-+ * 改指向,也不释放。所以调用方拿到指针后不需要持锁,也不必担心失效。
-+ * 代价是这份策略常驻内存(Mi 10 Ultra 上大约几百 KB 到 1 MB 多),换来的是
-+ * 外部查询永远看不到后续注入。
++ * 生命周期:开机时抓一次,之后只读。特性没启用时会在 on_boot_completed() 被释放
++ * (对齐上游 ksu_selinux_hide_drop_backup_if_unused() 的省内存行为),所以"永久
++ * 持有"这个前提不成立,每个读路径都必须自己管同步。
++ *
++ * 同步靠的是 selinux_ss 里现成的 policy_rwlock —— 4.19 上真实策略的任何改动
++ * (包括 KSU 注入规则)都走这把锁:
++ *   读者  read_lock  → 查 live → 解引用
++ *   释放  write_lock → 置 live=false → 销毁
++ * 释放拿写锁,所以只要读者在解引用期间持着读锁,销毁就一定排在它后面,不可能
++ * UAF。反过来"先看 live 再加锁"是错的:那个窗口里快照正好被销毁。
++ * 有意不复用 clean_view_lock 那把 mutex 做这件事 —— 它只用来把并发两次
++ * enable() 收敛成一次发布,不参与生命周期。
++ *
++ * 代价是这份策略常驻内存(Mi 10 Ultra 上大约几百 KB 到 1 MB 多),换来的是外部
++ * 查询永远看不到后续注入。
 + */
 +#include <linux/kernel.h>
 +#include <linux/module.h>
@@ -524,7 +573,7 @@
 + *
 + * security_read_policy() 返回的是 vmalloc_user 缓冲,而 selinuxfs 的
 + * sel_release_policy() 会对 plm->data 调 vfree() —— 所有权会打架。所以这里
-+ * 换一份普通 vmalloc 的副本长期持有,和 selinuxfs 之间只走拷���。
++ * 换一份普通 vmalloc 的副本持有,和 selinuxfs 之间只走拷贝。
 + *
 + * 它只被内核读(喂给 policydb_read),从不上映射给用户态,所以用 vmalloc
 + * 而不是 vmalloc_user 就够了。
@@ -533,11 +582,22 @@
 +static size_t clean_view_blob_len;
 +
 +/*
++ * 捕获时刻的 latest_granting。
++ *
++ * 4.19 把这个计数器挂在 struct selinux_ss 上而不是 policydb 里,快照带不出来。
++ * 但它【必须】跟着快照走:KSU 每注入一次规则就把它 +1(sel_write_access() 读
++ * 的就是它),于是真实值会在注入后偏离原厂。而 sel_write_access() 是原样把
++ * avd.seqno 打印给用户态的,检测方拿到的这个数字会不一样。
++ * 捕获时抄一份存着,查询时用它,输出就和没注入过的内核完全一致。
++ */
++static u32 clean_view_seqno;
++
++/*
 + * 快照是否可用的发布标志。
 + *
-+ * 写入只有 enable() 一处,而且是开机单线程;读的是 selinuxfs 的查询路径。
-+ * 用 release/acquire 发布:看到 live==true 的读者一定能看到先写的 clean_view_db,
-+ * 不会拿到"标志已置位但指针还是 NULL"的中间状态。
++ * 配 policy_rwlock 用:置位/清零都在写锁里,读侧在读锁里看,顺序天然成立。
++ * smp_store_release/smp_load_acquire 是双保险,读侧即使在没持锁的
++ * ready() 路径上也不会看到"标志已置位但指针还是 NULL"。
 + */
 +static bool clean_view_live;
 +
@@ -558,6 +618,7 @@
 +	struct policydb *db;
 +	void *blob, *kblob;
 +	size_t len = 0;
++	u32 seqno;
 +	int rc;
 +
 +	if (smp_load_acquire(&clean_view_live))
@@ -575,6 +636,10 @@
 +		vfree(blob);
 +		return -EINVAL;
 +	}
++
++	/* 抄在 security_read_policy() 之后、发布之前 —— 那把函数自己就持着
++	 * policy_rwlock 的读锁,这里只是把它读到的计数原样留一份。 */
++	seqno = selinux_state.ss ? selinux_state.ss->latest_granting : 0;
 +
 +	kblob = vmalloc(len);
 +	if (!kblob) {
@@ -605,10 +670,13 @@
 +		return rc;
 +	}
 +
++	/* 发布走写锁:和 disable() 走同一把,两者不可能交错。 */
++	write_lock(&selinux_state.ss->policy_rwlock);
 +	mutex_lock(&clean_view_lock);
 +	if (clean_view_live) {
 +		/* 并发的第二次调用:别人已经抓好了,丢掉自己这份。 */
 +		mutex_unlock(&clean_view_lock);
++		write_unlock(&selinux_state.ss->policy_rwlock);
 +		policydb_destroy(db);
 +		kfree(db);
 +		vfree(kblob);
@@ -617,15 +685,64 @@
 +	clean_view_db = db;
 +	clean_view_blob = kblob;
 +	clean_view_blob_len = len;
-+	/* release:上面三个指针的写必须先于 live 的写对读者可见。 */
++	clean_view_seqno = seqno;
++	/* release:上面几个字段的写必须先于 live 的写对读者可见。 */
 +	smp_store_release(&clean_view_live, true);
 +	mutex_unlock(&clean_view_lock);
++	write_unlock(&selinux_state.ss->policy_rwlock);
 +
-+	pr_info("selinux: clean view captured: %zu bytes, %u types, %u classes, %u roles\n",
-+		len, db->p_types.nprim, db->p_classes.nprim, db->p_roles.nprim);
++	pr_info("selinux: clean view captured: %zu bytes, %u types, %u classes, %u roles, seqno %u\n",
++		len, db->p_types.nprim, db->p_classes.nprim, db->p_roles.nprim, seqno);
 +	return 0;
 +}
 +EXPORT_SYMBOL_GPL(selinux_clean_view_enable);
++
++/*
++ * 释放快照,把内存还给系统。
++ *
++ * 上游的等价行为:ksu_selinux_hide_drop_backup_if_unused() 在 on_boot_completed()
++ * 发现特性没启用就把备份策略扔掉。对 4.19 来说这不是可有可无的优化 ——
++ * enable() 在快照不存在时会拒绝(返回 -EAGAIN,让管理器显示错误而不是静默
++ * 空转),所以"没启用就释放"是这个特性能自洽的前提,不是纯优化。
++ *
++ * 销毁拿的是 policy_rwlock 的【写】锁,所有读路径都持读锁,所以不可能有读者
++ * 正拿着 clean_view_db 解引用。置 live=false 必须在解锁之前,否则有读者会在
++ * 销毁完成后才通过 ready() 的检查。
++ */
++void selinux_clean_view_disable(void)
++{
++	struct policydb *db;
++	void *blob;
++	struct selinux_state *state = &selinux_state;
++
++	if (!state->ss)
++		return;
++
++	write_lock(&state->ss->policy_rwlock);
++	if (!smp_load_acquire(&clean_view_live)) {
++		write_unlock(&state->ss->policy_rwlock);
++		return;
++	}
++
++	db = clean_view_db;
++	blob = clean_view_blob;
++
++	/* 先让读者看见"没有了",再动手销毁。 */
++	smp_store_release(&clean_view_live, false);
++	clean_view_db = NULL;
++	clean_view_blob = NULL;
++	clean_view_blob_len = 0;
++	clean_view_seqno = 0;
++	write_unlock(&state->ss->policy_rwlock);
++
++	if (db) {
++		policydb_destroy(db);
++		kfree(db);
++	}
++	vfree(blob);
++	pr_info("selinux: clean view released\n");
++}
++EXPORT_SYMBOL_GPL(selinux_clean_view_disable);
 +
 +/*
 + * 给 ss/services.c 里的 selinux_clean_view_compute() 用。
@@ -635,14 +752,24 @@
 + * 把内核内部布局漏出去。compute() 被 static 的 context_struct_compute_av()
 + * 锁死在 services.c 里,而状态在这边 —— 这个窄接口就是这两者之间唯一的缝。
 + *
-+ * 返回的是稳定指针:enable() 之后既不改指向也不释放,调用方不用持锁。
++ * ⚠️ 调用方【必须】已经持有 ss->policy_rwlock(读或写都行)。原因见文件头:
++ * 快照是会释放的,"先看 live 再加锁"那个窗口里它可能正好被销毁。
 + */
 +struct policydb *selinux_clean_view_db(void)
 +{
 +	if (!smp_load_acquire(&clean_view_live))
 +		return NULL;
-+	return READ_ONCE(clean_view_db);
++	return clean_view_db;
 +}
++
++/*
++ * 捕获时刻的 avd.seqno。快照不在时返回 0。
++ */
++u32 selinux_clean_view_seqno(void)
++{
++	return smp_load_acquire(&clean_view_live) ? clean_view_seqno : 0;
++}
++EXPORT_SYMBOL_GPL(selinux_clean_view_seqno);
 +
 +/*
 + * 给 selinuxfs 的 /sys/fs/selinux/policy 用:拿一份快照的拷贝。
@@ -653,23 +780,34 @@
 + * 拷贝用 vmalloc_user 而不是 vmalloc:这份缓冲会被 remap_vmalloc_range() 映射
 + * 进用户态,和 security_read_policy() 原本产出的缓冲性质保持一致。
 + *
++ * 读锁覆盖整个拷贝过程:disable() 拿写锁,两者互斥,所以 blob 不会在
++ * memcpy 中途被 vfree 掉。
++ *
 + * 返回 0 成功;快照没就绪返回 -EAGAIN,调用方退回 security_read_policy()。
 + */
 +int selinux_clean_view_get_policy(void **data, size_t *len)
 +{
++	struct selinux_state *state = &selinux_state;
 +	void *buf;
 +
-+	if (!smp_load_acquire(&clean_view_live))
++	if (!state->ss)
 +		return -EAGAIN;
 +
-+	buf = vmalloc_user(clean_view_blob_len);
-+	if (!buf)
-+		return -ENOMEM;
-+	memcpy(buf, clean_view_blob, clean_view_blob_len);
++	read_lock(&state->ss->policy_rwlock);
++	if (!smp_load_acquire(&clean_view_live)) {
++		read_unlock(&state->ss->policy_rwlock);
++		return -EAGAIN;
++	}
 +
-+	*data = buf;
-+	*len = clean_view_blob_len;
-+	return 0;
++	buf = vmalloc_user(clean_view_blob_len);
++	if (buf) {
++		memcpy(buf, clean_view_blob, clean_view_blob_len);
++		*data = buf;
++		*len = clean_view_blob_len;
++	}
++	read_unlock(&state->ss->policy_rwlock);
++
++	return buf ? 0 : -ENOMEM;
 +}
 +
 +/*
@@ -691,16 +829,19 @@
 +	struct context *ctx;
 +	int ret = 0;
 +
-+	db = selinux_clean_view_db();
-+	if (!db || !state->ss || !state->initialized)
++	if (!state->ss || !state->initialized)
 +		return 0;
 +
++	/* 读锁先拿,再取指针 —— 顺序反了就有 UAF 窗口。 */
 +	read_lock(&state->ss->policy_rwlock);
-+	ctx = sidtab_search(state->ss->sidtab, sid);
-+	if (ctx && (ctx->type > db->p_types.nprim ||
-+		    ctx->role > db->p_roles.nprim ||
-+		    ctx->user > db->p_users.nprim))
-+		ret = 1;
++	db = selinux_clean_view_db();
++	if (db) {
++		ctx = sidtab_search(state->ss->sidtab, sid);
++		if (ctx && (ctx->type > db->p_types.nprim ||
++			    ctx->role > db->p_roles.nprim ||
++			    ctx->user > db->p_users.nprim))
++			ret = 1;
++	}
 +	read_unlock(&state->ss->policy_rwlock);
 +	return ret;
 +}

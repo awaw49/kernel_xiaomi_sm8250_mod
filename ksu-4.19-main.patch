@@ -1385,7 +1385,7 @@
  #endif
  
  static write_op_fn *context_write, *access_write;
-@@ -115,11 +118,16 @@
+@@ -115,13 +118,26 @@
      if (length)
          goto out;
  
@@ -1403,8 +1403,18 @@
 +    length = security_sid_to_context(&selinux_state, sid, &canon, &len);
      if (length)
          goto out;
++
++    length = -ERANGE;
++    if (len > SIMPLE_TRANSACTION_LIMIT) {
++        pr_err("SELinux: %s:  context size (%u) exceeds "
++               "payload max\n",
++               __func__, len);
++        goto out;
++    }
  #endif
-@@ -177,15 +185,16 @@
+ 
+     memcpy(buf, canon, len);
+@@ -177,15 +193,28 @@
  
      security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, &avd);
  #else
@@ -1419,12 +1429,24 @@
          goto out;
  
 -    security_compute_av_user(&fake_state, ssid, tsid, tclass, &avd);
++    /* 任一端是注入后才有的 type/role/user,就按"原厂策略里没这个 context"
++     * 处理 —— 见上面关于为什么不能退回真实判定的说明。 */
++    if (selinux_clean_view_context_is_new(ssid) ||
++        selinux_clean_view_context_is_new(tsid)) {
++        length = -EINVAL;
++        goto out;
++    }
++
++    /* 到这里还查不动,只可能是快照没就绪(隐藏没生效),那才是退回真实判定的
++     * 时候。compute() 内部对越界的 type/class 返回 -EINVAL,那属于"原厂策略
++     * 里没有这个 class",不是"没就绪",但此时两个 context 都已确认在原厂
++     * 策略内,退回去也不会泄出 KSU 的域。 */
 +    if (selinux_clean_view_compute(ssid, tsid, tclass, &avd))
 +        security_compute_av_user(&selinux_state, ssid, tsid, tclass, &avd);
  #endif
  
      length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x", avd.allowed, 0xffffffff, avd.auditallow,
-@@ -231,11 +240,17 @@
+@@ -231,11 +260,17 @@
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
          error = security_context_to_sid_with_policy(backup_sepolicy, str, size, &sid, SECSID_NULL, GFP_KERNEL);
  #else
@@ -1443,7 +1465,7 @@
      }
  
  call_orig:
-@@ -247,15 +262,15 @@
+@@ -247,15 +282,15 @@
  
  static void initialize_fake_status()
  {
@@ -1462,7 +1484,7 @@
      if (!status->enforcing && !ksu_late_loaded) {
          pr_warn("initialize_fake_status: skip not enforcing\n");
          goto out;
-@@ -282,7 +297,7 @@
+@@ -282,7 +317,7 @@
              new_status->policyload, new_status->enforcing);
  
  out:
@@ -1471,7 +1493,7 @@
  }
  
  typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
-@@ -291,9 +306,9 @@
+@@ -291,9 +326,9 @@
  {
      if (likely(current_uid().val >= 10000 && ksu_selinux_hide_enabled)) {
          void *data;
@@ -1483,7 +1505,7 @@
          if (data) {
              filp->private_data = data;
              return 0;
-@@ -313,10 +328,12 @@
+@@ -313,10 +348,12 @@
  {
      int ret;
      pr_info("selinux_hide: init selinux hide\n");
@@ -1496,7 +1518,7 @@
      selinux_write_op = find_kernel_symbol_exact("write_op");
      if (!selinux_write_op) {
          pr_err("selinux_hide: no write_op found!\n");
-@@ -334,8 +351,17 @@
+@@ -334,8 +371,25 @@
          pr_warn("context_struct_compute_av not found!\n");
      }
  #else
@@ -1508,15 +1530,23 @@
 +     * 视图(ss/services.c 里的 selinux_clean_view_compute()),那里是
 +     * 一份独立重新解析出来的原厂策略。fake_state 全部删掉。
 +     *
-+     * 快照没就绪时钩子照样装得上,只是每次查询都退回真实判定 ——
-+     * 功能不受影响,但等于什么都没隐藏,得说清楚,不然用户开了开关
-+     * 却看不到任何效果,根本不知道卡在哪。 */
-+    if (!selinux_clean_view_ready())
-+        pr_err("selinux_hide: clean policy view not ready, hiding is a no-op!\n");
++     * 这句就是 6.6 分支上面那个 `if (!backup_sepolicy) return -EAGAIN`
++     * 的 4.19 等价物:没有备份策略就【拒绝启用】,而不是装上一堆
++     * 什么也不干的钩子。区别是用户能看见 —— 管理器会显示
++     * "no backup sepolicy available, please save feature and reboot to
++     * retry!",开关保持关,状态栏能看到失败原因。
++     *
++     * 正常情况下走不到这里:快照在 ksu_selinux_hide_init() 里开机就抓
++     * 好了(必须赶在 apply_kernelsu_rules() 之前)。真走到就是抓取失败
++     * 了,那时候确实不该假装能用。 */
++    if (!selinux_clean_view_ready()) {
++        pr_err("no backup sepolicy available, please save feature and reboot to retry!\n");
++        return -EAGAIN;
++    }
  #endif
  
      context_write = &selinux_write_op[SEL_CONTEXT];
-@@ -486,6 +512,12 @@
+@@ -486,6 +540,12 @@
  
  void __init ksu_selinux_hide_init()
  {
@@ -1529,7 +1559,7 @@
      if (ksu_register_feature_handler(&selinux_hide_handler)) {
          pr_err("Failed to register selinux_hide feature handler\n");
      }
-@@ -506,15 +538,20 @@
+@@ -506,22 +566,35 @@
      }
      mutex_unlock(&selinux_hide_mutex);
      ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
@@ -1544,23 +1574,36 @@
  
  void ksu_selinux_hide_drop_backup_if_unused()
  {
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-+    /* 5.x 上 backup_sepolicy 是 ksu_dup_sepolicy() 深拷贝出来的一份,释放它安全。
-+     * 4.19 上压根没有"备份策略"这个概念(fake_state 直接共享 selinux_state.ss),
-+     * 没有副本可丢 —— 而且 backup_sepolicy 在我们这版 rules.c 里根本不存在,
-+     * 连判空都是活引用。所以这里是空操作,函数本身留着给 boot_event.c 调。 */
      mutex_lock(&selinux_hide_mutex);
-     if (!ksu_selinux_hide_running && backup_sepolicy) {
-         pr_info("selinux_hide is not enabled - drop backup_sepolicy\n");
-@@ -524,6 +561,7 @@
-         backup_sepolicy = NULL;
+-    if (!ksu_selinux_hide_running && backup_sepolicy) {
+-        pr_info("selinux_hide is not enabled - drop backup_sepolicy\n");
+-        sidtab_destroy(backup_sepolicy->sidtab);
+-        kfree(backup_sepolicy->sidtab);
+-        ksu_destroy_sepolicy(backup_sepolicy);
+-        backup_sepolicy = NULL;
++    if (!ksu_selinux_hide_running) {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
++        /* 5.x 上 backup_sepolicy 是 ksu_dup_sepolicy() 深拷贝出来的一份。 */
++        if (backup_sepolicy) {
++            pr_info("selinux_hide is not enabled - drop backup_sepolicy\n");
++            sidtab_destroy(backup_sepolicy->sidtab);
++            kfree(backup_sepolicy->sidtab);
++            ksu_destroy_sepolicy(backup_sepolicy);
++            backup_sepolicy = NULL;
++        }
++#else
++        /* 4.19:释放内核侧那份干净视图。内核里的 disable() 拿 policy_rwlock
++         * 写锁,和所有读路径互斥,不用担心有人正拿着指针 —— 细节在
++         * security/selinux/clean_view.c 的文件头。 */
++        if (selinux_clean_view_ready()) {
++            pr_info("selinux_hide is not enabled - drop clean policy view\n");
++            selinux_clean_view_disable();
++        }
++#endif
      }
      mutex_unlock(&selinux_hide_mutex);
-+#endif
  }
- 
- #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-@@ -605,7 +643,7 @@
+@@ -605,7 +678,7 @@
      return rc;
  }
  
@@ -1569,7 +1612,7 @@
                                                 u32 *sid, u32 def_sid, gfp_t gfp_flags)
  {
      struct policydb *policydb;
-@@ -712,7 +750,7 @@
+@@ -712,7 +785,7 @@
      return rc;
  }
  
@@ -1578,7 +1621,7 @@
                                                 u32 *scontext_len)
  {
      struct policydb *policydb;
-@@ -744,7 +782,7 @@
+@@ -744,7 +817,7 @@
      return rc;
  }
  
@@ -1587,7 +1630,7 @@
  {
      avd->allowed = 0;
      avd->auditallow = 0;
-@@ -1085,7 +1123,7 @@
+@@ -1085,7 +1158,7 @@
      type_attribute_bounds_av(policydb, scontext, tcontext, tclass, avd);
  }
  
