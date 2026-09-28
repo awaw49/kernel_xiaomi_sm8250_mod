@@ -3750,3 +3750,53 @@
  #include <linux/overflow.h>
  #include <linux/sched/signal.h>
  #include <linux/slab.h>
+--- a/kernel/include/arch.h
++++ b/kernel/include/arch.h
+@@ -70,6 +70,13 @@
+ #define PT_REGS_IP(x) (__PT_REGS_CAST(x)->__PT_IP_REG)
+ #define PT_REGS_ORIG_SYSCALL(x) (__PT_REGS_CAST(x)->__PT_ORIG_SYSCALL_REG)
+ 
++/* 4.19 的 arm64 没有 ftrace-kprobe,pre_handler 拿到的 regs 就是硬件异常
++ * 保存的真实 pt_regs,不能再套一层 PARM1 —— 那会把 reboot() 的 magic1
++ * (0xDEADBEEF)当成指针解引用。详见 gen_ksu_patch.py:build_arch_h_real_regs。 */
++#ifdef CONFIG_KPROBES_ON_FTRACE
+ #define PT_REAL_REGS(regs) ((struct pt_regs *)PT_REGS_PARM1(regs))
++#else
++#define PT_REAL_REGS(regs) (regs)
++#endif
+ 
+ #endif
+--- a/kernel/kpm/super_access.c
++++ b/kernel/kpm/super_access.c
+@@ -228,10 +228,10 @@
+             for (size_t i1 = 0; i1 < info->count; i1++) {
+                 if (strcmp(info->members[i1].name, member_name) == 0) {
+                     if (out_offset)
+-                        *out_offset = info->members[i].offset;
++                        *out_offset = info->members[i1].offset;
+ 
+                     if (out_size)
+-                        *out_size = info->members[i].size;
++                        *out_size = info->members[i1].size;
+ 
+                     return 0;
+                 }
+--- a/kernel/infra/seccomp_cache.c
++++ b/kernel/infra/seccomp_cache.c
+@@ -6,6 +6,11 @@
+ #include <linux/filter.h>
+ #include <linux/seccomp.h>
+ #include "klog.h" // IWYU pragma: keep
++/* 4.19 的 struct seccomp_filter 里没有 action_cache,这份内存布局
++ * 镜像是照 5.7+ 抄的,set_bit 会写到 kmalloc-32 对象的第 28..35 字节 ——
++ * 越界踩相邻 slab 对象。4.19 的 seccomp 本来就是纯 BPF 求值、没有快路径,
++ * 所以这里整段 no-op。细节见 gen_ksu_patch.py:build_seccomp_cache_419。 */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
+ #include "infra/seccomp_cache.h"
+ 
+ struct action_cache {
+@@ -63,3 +68,4 @@
+     }
+ #endif
+ }
++#endif
