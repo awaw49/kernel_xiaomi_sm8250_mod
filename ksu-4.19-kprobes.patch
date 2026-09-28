@@ -368,7 +368,7 @@
   * allocated string of the correct size.  Set `*scontext'
 --- /dev/null
 +++ b/security/selinux/include/clean_view.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,104 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * 干净策略视图 —— 4.19 上给 SELinux 补的"策略快照"能力。
@@ -429,6 +429,14 @@
 +struct policydb *selinux_clean_view_db(void);
 +int selinux_clean_view_get_policy(void **data, size_t *len);
 +
++/*
++ * 这个 context 是不是注入规则之后才出现的。返回 1 表示【确定】是后加的,
++ * 返回 0 表示不是 —— 或者压根判断不了(快照没就绪、SID 查不到),那种情况
++ * 调用方应当不干预、走真实路径。方向不能反:反了会把 /sys/fs/selinux/context
++ * 整个打废。
++ */
++int selinux_clean_view_context_is_new(u32 sid);
++
 +#else /* !CONFIG_SECURITY_SELINUX */
 +
 +static inline int selinux_clean_view_enable(void)
@@ -457,12 +465,17 @@
 +	return -EOPNOTSUPP;
 +}
 +
++static inline int selinux_clean_view_context_is_new(u32 sid)
++{
++	return 0;
++}
++
 +#endif /* CONFIG_SECURITY_SELINUX */
 +
 +#endif /* _SELINUX_CLEAN_VIEW_H */
 --- /dev/null
 +++ b/security/selinux/clean_view.c
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,229 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * 干净策略视图 —— 捕获侧。
@@ -499,6 +512,8 @@
 +
 +#include "security.h"
 +#include "clean_view.h"
++#include "ss/services.h"
++#include "ss/sidtab.h"
 +#include "ss/policydb.h"
 +
 +/* 干净策略自己的 policydb。见文件头:重新解析出来的,和真实策略零共享。 */
@@ -656,3 +671,37 @@
 +	*len = clean_view_blob_len;
 +	return 0;
 +}
++
++/*
++ * 这个 context 是不是【注入规则之后才出现】的。
++ *
++ * 判据是索引比较,成立的前提是 4.19 往策略里加符号时只追加、不重排 —— 已核实:
++ * 内核加载策略时是 policydb.c 的 `role->value = ++p->p_roles.nprim`,
++ * KSU 注入时是 sepolicy.c 的 `u32 value = ++db->p_types.nprim`,都是取完再加一。
++ * 于是"真实 sidtab 解析出来的索引 > 快照 nprim"就等价于"原厂策略里没有这个东西"。
++ *
++ * 返回方向的讲究:只在【能确定】是后加的时返回 1,其余一律 0。快照没就绪、
++ * sid 查不到、已初始化判断不了 —— 全返回 0,也就是"不干预",让调用方走真实路径。
++ * 反过来(拿不准就拒绝)会把 /sys/fs/selinux/context 整个打废,是不可接受的降级。
++ */
++int selinux_clean_view_context_is_new(u32 sid)
++{
++	struct selinux_state *state = &selinux_state;
++	struct policydb *db;
++	struct context *ctx;
++	int ret = 0;
++
++	db = selinux_clean_view_db();
++	if (!db || !state->ss || !state->initialized)
++		return 0;
++
++	read_lock(&state->ss->policy_rwlock);
++	ctx = sidtab_search(state->ss->sidtab, sid);
++	if (ctx && (ctx->type > db->p_types.nprim ||
++		    ctx->role > db->p_roles.nprim ||
++		    ctx->user > db->p_users.nprim))
++		ret = 1;
++	read_unlock(&state->ss->policy_rwlock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(selinux_clean_view_context_is_new);

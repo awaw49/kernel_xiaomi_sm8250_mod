@@ -1362,7 +1362,7 @@
  #include "avc.h"
  #include "klog.h" // IWYU pragma: keep
  #include "linux/kallsyms.h"
-@@ -62,11 +67,11 @@
+@@ -62,19 +67,17 @@
  static write_op_fn *selinux_write_op;
  
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
@@ -1377,7 +1377,34 @@
                                                   struct av_decision *avd);
  static void (*security_dump_masked_av_fn)(struct policydb *policydb, struct context *scontext, struct context *tcontext,
                                            u16 tclass, u32 permissions, const char *reason) = NULL;
-@@ -177,15 +182,16 @@
+ static void (*context_struct_compute_av_fn)(struct policydb *policydb, struct context *scontext,
+                                             struct context *tcontext, u16 tclass, struct av_decision *avd,
+                                             struct extended_perms *xperms) = NULL;
+-#else
+-static struct selinux_state fake_state;
+ #endif
+ 
+ static write_op_fn *context_write, *access_write;
+@@ -115,11 +118,16 @@
+     if (length)
+         goto out;
+ 
+-    length = security_context_to_sid(&fake_state, buf, size, &sid, GFP_KERNEL);
++    length = security_context_to_sid(&selinux_state, buf, size, &sid, GFP_KERNEL);
+     if (length)
+         goto out;
+ 
+-    length = security_sid_to_context(&fake_state, sid, &canon, &len);
++    if (selinux_clean_view_context_is_new(sid)) {
++        length = -EINVAL;
++        goto out;
++    }
++
++    length = security_sid_to_context(&selinux_state, sid, &canon, &len);
+     if (length)
+         goto out;
+ #endif
+@@ -177,15 +185,16 @@
  
      security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, &avd);
  #else
@@ -1397,7 +1424,26 @@
  #endif
  
      length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x", avd.allowed, 0xffffffff, avd.auditallow,
-@@ -247,15 +253,15 @@
+@@ -231,11 +240,17 @@
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+         error = security_context_to_sid_with_policy(backup_sepolicy, str, size, &sid, SECSID_NULL, GFP_KERNEL);
+ #else
+-        error = security_context_to_sid(&fake_state, str, size, &sid, GFP_KERNEL);
++        error = security_context_to_sid(&selinux_state, str, size, &sid, GFP_KERNEL);
+ #endif
+         if (error) {
+             return error;
+         }
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
++        /* 同 my_write_context:目标 context 是注入后才有的,原厂策略里没有。
++         * 判断不了的时候不干预,走原来的逻辑。 */
++        if (selinux_clean_view_context_is_new(sid))
++            return -EINVAL;
++#endif
+     }
+ 
+ call_orig:
+@@ -247,15 +262,15 @@
  
  static void initialize_fake_status()
  {
@@ -1416,7 +1462,7 @@
      if (!status->enforcing && !ksu_late_loaded) {
          pr_warn("initialize_fake_status: skip not enforcing\n");
          goto out;
-@@ -282,7 +288,7 @@
+@@ -282,7 +297,7 @@
              new_status->policyload, new_status->enforcing);
  
  out:
@@ -1425,7 +1471,7 @@
  }
  
  typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
-@@ -291,9 +297,9 @@
+@@ -291,9 +306,9 @@
  {
      if (likely(current_uid().val >= 10000 && ksu_selinux_hide_enabled)) {
          void *data;
@@ -1437,7 +1483,7 @@
          if (data) {
              filp->private_data = data;
              return 0;
-@@ -313,10 +319,12 @@
+@@ -313,10 +328,12 @@
  {
      int ret;
      pr_info("selinux_hide: init selinux hide\n");
@@ -1450,26 +1496,27 @@
      selinux_write_op = find_kernel_symbol_exact("write_op");
      if (!selinux_write_op) {
          pr_err("selinux_hide: no write_op found!\n");
-@@ -334,8 +342,16 @@
+@@ -334,8 +351,17 @@
          pr_warn("context_struct_compute_av not found!\n");
      }
  #else
 -    fake_state.initialized = true;
 -    fake_state.policy = backup_sepolicy;
 +    /* 4.19 没有 selinux_state.policy —— policydb 在 selinux_state.ss 里,
-+     * 而整份浅拷贝已经把 .ss 带过去了,不需要再单独指一次。
++     * 浅拷贝 fake_state 带过去的 .ss 指针原封不动,查询打上去和真实
++     * 策略完全一样,等于没藏。4.19 改为让三个出口都走内核侧的干净
++     * 视图(ss/services.c 里的 selinux_clean_view_compute()),那里是
++     * 一份独立重新解析出来的原厂策略。fake_state 全部删掉。
 +     *
-+     * 注意这份浅拷贝现在只服务 my_write_context() / my_setprocattr() 这两个
-+     * 本次没做的出口 —— 它们共享同一个 ss 指针,行为和不隐藏时完全一样。
-+     * 真正生效的是 my_write_access() 走内核侧的干净视图。 */
-+    fake_state = selinux_state;
-+
++     * 快照没就绪时钩子照样装得上,只是每次查询都退回真实判定 ——
++     * 功能不受影响,但等于什么都没隐藏,得说清楚,不然用户开了开关
++     * 却看不到任何效果,根本不知道卡在哪。 */
 +    if (!selinux_clean_view_ready())
 +        pr_err("selinux_hide: clean policy view not ready, hiding is a no-op!\n");
  #endif
  
      context_write = &selinux_write_op[SEL_CONTEXT];
-@@ -445,6 +461,17 @@
+@@ -445,6 +471,17 @@
  
  void ksu_selinux_hide_handle_second_stage()
  {
@@ -1487,7 +1534,7 @@
      initialize_fake_status();
      // https://github.com/torvalds/linux/blame/e8c2f9fdadee7cbc75134dc463c1e0d856d6e5c7/security/selinux/selinuxfs.c#L2014
      if (fake_status) {
-@@ -506,15 +533,20 @@
+@@ -506,15 +543,20 @@
      }
      mutex_unlock(&selinux_hide_mutex);
      ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
@@ -1510,7 +1557,7 @@
      mutex_lock(&selinux_hide_mutex);
      if (!ksu_selinux_hide_running && backup_sepolicy) {
          pr_info("selinux_hide is not enabled - drop backup_sepolicy\n");
-@@ -524,6 +556,7 @@
+@@ -524,6 +566,7 @@
          backup_sepolicy = NULL;
      }
      mutex_unlock(&selinux_hide_mutex);
@@ -1518,7 +1565,7 @@
  }
  
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-@@ -605,7 +638,7 @@
+@@ -605,7 +648,7 @@
      return rc;
  }
  
@@ -1527,7 +1574,7 @@
                                                 u32 *sid, u32 def_sid, gfp_t gfp_flags)
  {
      struct policydb *policydb;
-@@ -712,7 +745,7 @@
+@@ -712,7 +755,7 @@
      return rc;
  }
  
@@ -1536,7 +1583,7 @@
                                                 u32 *scontext_len)
  {
      struct policydb *policydb;
-@@ -744,7 +777,7 @@
+@@ -744,7 +787,7 @@
      return rc;
  }
  
@@ -1545,7 +1592,7 @@
  {
      avd->allowed = 0;
      avd->auditallow = 0;
-@@ -1085,7 +1118,7 @@
+@@ -1085,7 +1128,7 @@
      type_attribute_bounds_av(policydb, scontext, tcontext, tclass, avd);
  }
  
