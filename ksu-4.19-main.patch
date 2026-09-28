@@ -1516,25 +1516,20 @@
  #endif
  
      context_write = &selinux_write_op[SEL_CONTEXT];
-@@ -445,6 +471,17 @@
+@@ -486,6 +512,12 @@
  
- void ksu_selinux_hide_handle_second_stage()
+ void __init ksu_selinux_hide_init()
  {
 +#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
-+    /* 4.19:趁策略还干净,抓一份原厂策略下来。
-+     *
-+     * 为什么必须放在这里而不是 hide 的 enable() 里:enable() 是用户在管理器
-+     * 里点开关时才走的,那时候 apply_kernelsu_rules() 早跑完了,策略里已经
-+     * 有 KSU 的 type 和规则,再抓等于抓了个寂寞。5.x 上不存在这个问题,那边
-+     * 的快照由 ksu_dup_sepolicy() 在换掉策略之前做掉。
-+     */
++    /* 4.19:趁策略还干净,抓一份原厂策略下来。必须在任何 apply_kernelsu_rules()
++     * 之前 —— 见下面长注释里两条注入路径的说明。 */
 +    if (selinux_clean_view_enable())
 +        pr_err("selinux_hide: failed to capture clean policy view, hiding is off\n");
 +#endif
-     initialize_fake_status();
-     // https://github.com/torvalds/linux/blame/e8c2f9fdadee7cbc75134dc463c1e0d856d6e5c7/security/selinux/selinuxfs.c#L2014
-     if (fake_status) {
-@@ -506,15 +543,20 @@
+     if (ksu_register_feature_handler(&selinux_hide_handler)) {
+         pr_err("Failed to register selinux_hide feature handler\n");
+     }
+@@ -506,15 +538,20 @@
      }
      mutex_unlock(&selinux_hide_mutex);
      ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
@@ -1557,7 +1552,7 @@
      mutex_lock(&selinux_hide_mutex);
      if (!ksu_selinux_hide_running && backup_sepolicy) {
          pr_info("selinux_hide is not enabled - drop backup_sepolicy\n");
-@@ -524,6 +566,7 @@
+@@ -524,6 +561,7 @@
          backup_sepolicy = NULL;
      }
      mutex_unlock(&selinux_hide_mutex);
@@ -1565,7 +1560,7 @@
  }
  
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-@@ -605,7 +648,7 @@
+@@ -605,7 +643,7 @@
      return rc;
  }
  
@@ -1574,7 +1569,7 @@
                                                 u32 *sid, u32 def_sid, gfp_t gfp_flags)
  {
      struct policydb *policydb;
-@@ -712,7 +755,7 @@
+@@ -712,7 +750,7 @@
      return rc;
  }
  
@@ -1583,7 +1578,7 @@
                                                 u32 *scontext_len)
  {
      struct policydb *policydb;
-@@ -744,7 +787,7 @@
+@@ -744,7 +782,7 @@
      return rc;
  }
  
@@ -1592,7 +1587,7 @@
  {
      avd->allowed = 0;
      avd->auditallow = 0;
-@@ -1085,7 +1128,7 @@
+@@ -1085,7 +1123,7 @@
      type_attribute_bounds_av(policydb, scontext, tcontext, tclass, avd);
  }
  
