@@ -3783,20 +3783,32 @@
                  }
 --- a/kernel/infra/seccomp_cache.c
 +++ b/kernel/infra/seccomp_cache.c
-@@ -6,6 +6,11 @@
- #include <linux/filter.h>
+@@ -7,6 +7,13 @@
  #include <linux/seccomp.h>
  #include "klog.h" // IWYU pragma: keep
+ #include "infra/seccomp_cache.h"
++
 +/* 4.19 的 struct seccomp_filter 里没有 action_cache,这份内存布局
 + * 镜像是照 5.7+ 抄的,set_bit 会写到 kmalloc-32 对象的第 28..35 字节 ——
 + * 越界踩相邻 slab 对象。4.19 的 seccomp 本来就是纯 BPF 求值、没有快路径,
-+ * 所以这里整段 no-op。细节见 gen_ksu_patch.py:build_seccomp_cache_419。 */
++ * 所以这里留同签名的空实现。细节见
++ * gen_ksu_patch.py:build_seccomp_cache_419。 */
 +#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
- #include "infra/seccomp_cache.h"
  
  struct action_cache {
-@@ -63,3 +68,4 @@
+     DECLARE_BITMAP(allow_native, SECCOMP_ARCH_NATIVE_NR);
+@@ -63,3 +70,14 @@
      }
  #endif
  }
++#else
++void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
++{
++    /* 4.19 的 seccomp_filter 没有快路径 bitmap,没有东西要清。 */
++}
++
++void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
++{
++    /* 同上:没有缓存可点,BPF 求值照旧走。 */
++}
 +#endif
