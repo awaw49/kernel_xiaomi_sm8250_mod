@@ -1362,7 +1362,7 @@
  #include "avc.h"
  #include "klog.h" // IWYU pragma: keep
  #include "linux/kallsyms.h"
-@@ -62,19 +67,17 @@
+@@ -62,23 +67,47 @@
  static write_op_fn *selinux_write_op;
  
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
@@ -1385,7 +1385,37 @@
  #endif
  
  static write_op_fn *context_write, *access_write;
-@@ -115,13 +118,26 @@
+ static write_op_fn orig_context_write, orig_access_write;
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
++
++/* 4.19 补齐 —— 除 context / access 之外还要一起藏的四个 write_op 槽。
++ * 下标取自本文件顶上那份 enum sel_inos,那是 4.19 selinuxfs.c 的逐字拷贝
++ * (连只有 6.x 才有的 SEL_COMPAT_NET 都在),所以 SEL_CREATE=7 / SEL_RELABEL=8 /
++ * SEL_USER=9 / SEL_MEMBER=14 和 4.19 逐一对得上。这几个下标都排在
++ * SEL_COMPAT_NET 之前,就算哪天那份 enum 抄漏了也还是对的。 */
++enum ksu_hide_txn_id { TXN_CREATE, TXN_RELABEL, TXN_USER, TXN_MEMBER, TXN_COUNT };
++static const int ksu_hide_txn_ino[TXN_COUNT] = { SEL_CREATE, SEL_RELABEL, SEL_USER, SEL_MEMBER };
++static write_op_fn *ksu_hide_txn_slot[TXN_COUNT];
++static write_op_fn ksu_hide_txn_orig[TXN_COUNT];
++static ssize_t my_write_create(struct file *, char *, size_t);
++static ssize_t my_write_relabel(struct file *, char *, size_t);
++static ssize_t my_write_user(struct file *, char *, size_t);
++static ssize_t my_write_member(struct file *, char *, size_t);
++static write_op_fn ksu_hide_txn_new[TXN_COUNT] = { my_write_create, my_write_relabel, my_write_user, my_write_member };
++
++/* validatetrans 不在 write_op[] 里 —— 它挂在 sel_transition_ops.write 上,
++ * 签名还是老的一代(带 __user 和 ppos),单独一个 typedef。 */
++typedef ssize_t (*validatetrans_write_fn)(struct file *, const char __user *, size_t, loff_t *);
++static validatetrans_write_fn *validatetrans_write;
++static validatetrans_write_fn orig_validatetrans_write;
++static ssize_t my_write_validatetrans(struct file *, const char __user *, size_t, loff_t *);
++
++#endif /* < 6.6 */
+ 
+ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
+ {
+@@ -115,13 +144,26 @@
      if (length)
          goto out;
  
@@ -1414,7 +1444,7 @@
  #endif
  
      memcpy(buf, canon, len);
-@@ -177,15 +193,28 @@
+@@ -177,15 +219,28 @@
  
      security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, &avd);
  #else
@@ -1446,7 +1476,147 @@
  #endif
  
      length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x", avd.allowed, 0xffffffff, avd.auditallow,
-@@ -231,11 +260,17 @@
+@@ -195,6 +250,139 @@
+     kfree(scon);
+     return length;
+ }
++
++/* ---- 4.19 补齐:create / relabel / user / member / validatetrans 五个出口 ---- */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
++
++/* kernel isspace() 认的字符集(include/linux/ctype.h)。写死 6 个比较,比为了
++ * 一个宏去拉 <linux/ctype.h> 划算 —— 这是 selinuxfs 的写路径,每个请求都走。 */
++static bool ksu_hide_isspace(char c)
++{
++    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
++}
++
++/*
++ * 扫 buf 开头 nctx 个空白分隔的 token,看有没有哪个 context 是 KSU 注入之后
++ * 才出现的 —— 在真实策略里解析得出 sid,但原厂快照里查不到。有就返回 true。
++ *
++ * token 切分照抄原厂 sscanf("%s") 的语义:跳前导空白,吃到下一个空白为止。
++ * create 的第 4 个参数是 %2f 百分号编码的对象名,不是 context,正好被跳过。
++ *
++ * 为什么扫 buf 就够,不必把这五个出口的计算逻辑整个重写:
++ *   create        查 type_transition
++ *   relabel       查 type_change
++ *   member        查 type_member
++ *   validatetrans 查 type_transition + type_change
++ * 而 KSU 往策略里只加三样东西:新的 type / attribute、type→attribute 挂链、
++ * 一条 permissive 加若干 allow 规则。它【不动】任何一条
++ * type_transition / type_change / type_member 规则,也不改这些 type 上的
++ * create / change / member 标志位。所以只要请求里出现的 context 全是原厂
++ * 就有的,算出来的答案和原厂策略逐字节相同 —— 原样转交原函数即可,不用把
++ * security_transition_sid_user() / security_validate_transition_user() 那
++ * 几套复制一份(复制就会随上游演进腐化,policy/feature.c 的处理方式同理)。
++ *
++ * 真正会泄的只有一种:请求里点名了 KSU 注入的 type。原厂策略里根本没有这个
++ * type,原函数会老老实实把它解析出来并算出结果。这种情况返回 -EINVAL,和
++ * 原厂策略里"没这个 type"时原函数返回的值完全一致,外部看不出来。
++ *
++ * 判断不了(快照没就绪 / 串超长 / 真实策略里也解析不出来)一律返回 false,即
++ * 不干预 —— 方向不能反,反了会把这五个出口整个打废。
++ *
++ * 详见 gen_ksu_patch.py:build_selinux_hide_txn_419。
++ */
++static bool ksu_hide_buf_has_new_ctx(const char *buf, int nctx)
++{
++    char tok[256];
++    const char *p = buf;
++    int i;
++
++    for (i = 0; i < nctx; i++) {
++        size_t n = 0;
++        u32 sid;
++
++        while (ksu_hide_isspace(*p))
++            p++;
++        if (!*p)
++            return false; /* token 不够,原函数会按 sscanf 失败报 -EINVAL */
++
++        while (*p && !ksu_hide_isspace(*p)) {
++            /* 超长的串真实策略也解析不出来(sidtab 里的名字都远短于此),
++             * 原函数自己会报 -EINVAL,这里不干预。256 取 5.x
++             * SECURITY_CONTEXT_MAX_LEN 的值,和上游新内核的闸门一致 —— 4.19
++             * 的 security_context_to_sid() 还没有这道闸。 */
++            if (n >= sizeof(tok) - 1)
++                return false;
++            tok[n++] = *p++;
++        }
++        tok[n] = '\0';
++
++        /* 真实策略里都解析不出来的,原函数自己会报 -EINVAL,不用管 */
++        if (security_context_str_to_sid(&selinux_state, tok, &sid, GFP_KERNEL))
++            return false;
++
++        if (selinux_clean_view_context_is_new(sid))
++            return true;
++    }
++    return false;
++}
++
++/* write_op[] 那四个:buf 是 simple_transaction_get() 交出来的整页零缓冲,
++ * 已经 NUL 结尾,而且每个 handler 进去第一件事都是自己 avc_has_perm ——
++ * 权限判定原封不动,这里只拦"请求里点了 KSU 注入的 type"这一种。 */
++static ssize_t my_write_create(struct file *file, char *buf, size_t size)
++{
++    if (likely(current_uid().val < 10000) || !ksu_hide_buf_has_new_ctx(buf, 3))
++        return ksu_hide_txn_orig[TXN_CREATE](file, buf, size);
++    return -EINVAL;
++}
++
++static ssize_t my_write_relabel(struct file *file, char *buf, size_t size)
++{
++    if (likely(current_uid().val < 10000) || !ksu_hide_buf_has_new_ctx(buf, 2))
++        return ksu_hide_txn_orig[TXN_RELABEL](file, buf, size);
++    return -EINVAL;
++}
++
++static ssize_t my_write_user(struct file *file, char *buf, size_t size)
++{
++    if (likely(current_uid().val < 10000) || !ksu_hide_buf_has_new_ctx(buf, 1))
++        return ksu_hide_txn_orig[TXN_USER](file, buf, size);
++    return -EINVAL;
++}
++
++static ssize_t my_write_member(struct file *file, char *buf, size_t size)
++{
++    if (likely(current_uid().val < 10000) || !ksu_hide_buf_has_new_ctx(buf, 2))
++        return ksu_hide_txn_orig[TXN_MEMBER](file, buf, size);
++    return -EINVAL;
++}
++
++/* validatetrans 收的是用户指针,得自己拷一份。复刻原函数的两道前置检查
++ * (count >= PAGE_SIZE 和 *ppos != 0)只为不白分配一页,判定逻辑本身没动过。 */
++static ssize_t my_write_validatetrans(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
++{
++    char *req;
++    bool hidden;
++
++    if (likely(current_uid().val < 10000))
++        return orig_validatetrans_write(file, buf, count, ppos);
++
++    if (count >= PAGE_SIZE || *ppos != 0)
++        return orig_validatetrans_write(file, buf, count, ppos);
++
++    req = memdup_user_nul(buf, count);
++    if (IS_ERR(req))
++        return orig_validatetrans_write(file, buf, count, ppos);
++
++    hidden = ksu_hide_buf_has_new_ctx(req, 3);
++    kfree(req);
++
++    if (hidden)
++        return -EINVAL;
++    return orig_validatetrans_write(file, buf, count, ppos);
++}
++
++#endif /* < 6.6 */
+ 
+ static int my_setprocattr(const char *name, void *value, size_t size);
+ struct ksu_lsm_hook selinux_setprocattr_hook = KSU_LSM_HOOK_INIT(setprocattr, "selinux_setprocattr", my_setprocattr, 0);
+@@ -231,11 +419,17 @@
  #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
          error = security_context_to_sid_with_policy(backup_sepolicy, str, size, &sid, SECSID_NULL, GFP_KERNEL);
  #else
@@ -1465,7 +1635,7 @@
      }
  
  call_orig:
-@@ -247,15 +282,15 @@
+@@ -247,15 +441,15 @@
  
  static void initialize_fake_status()
  {
@@ -1484,7 +1654,7 @@
      if (!status->enforcing && !ksu_late_loaded) {
          pr_warn("initialize_fake_status: skip not enforcing\n");
          goto out;
-@@ -282,7 +317,7 @@
+@@ -282,7 +476,7 @@
              new_status->policyload, new_status->enforcing);
  
  out:
@@ -1493,7 +1663,7 @@
  }
  
  typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
-@@ -291,9 +326,9 @@
+@@ -291,9 +485,9 @@
  {
      if (likely(current_uid().val >= 10000 && ksu_selinux_hide_enabled)) {
          void *data;
@@ -1505,7 +1675,7 @@
          if (data) {
              filp->private_data = data;
              return 0;
-@@ -313,10 +348,12 @@
+@@ -313,10 +507,12 @@
  {
      int ret;
      pr_info("selinux_hide: init selinux hide\n");
@@ -1518,7 +1688,7 @@
      selinux_write_op = find_kernel_symbol_exact("write_op");
      if (!selinux_write_op) {
          pr_err("selinux_hide: no write_op found!\n");
-@@ -334,8 +371,25 @@
+@@ -334,8 +530,25 @@
          pr_warn("context_struct_compute_av not found!\n");
      }
  #else
@@ -1546,7 +1716,79 @@
  #endif
  
      context_write = &selinux_write_op[SEL_CONTEXT];
-@@ -486,6 +540,12 @@
+@@ -358,6 +571,42 @@
+         goto unhook;
+     }
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
++    int i;
++
++    for (i = 0; i < ARRAY_SIZE(ksu_hide_txn_ino); i++) {
++        ksu_hide_txn_slot[i] = &selinux_write_op[ksu_hide_txn_ino[i]];
++        ksu_hide_txn_orig[i] = *ksu_hide_txn_slot[i];
++        ret = ksu_patch_text(ksu_hide_txn_slot[i], &ksu_hide_txn_new[i], sizeof(write_op_fn),
++                             KSU_PATCH_TEXT_FLUSH_DCACHE);
++        if (ret) {
++            pr_err("selinux_hide: init: patch_text ino=%d err: %d\n", ksu_hide_txn_ino[i], ret);
++            goto unhook;
++        }
++    }
++
++    /* validatetrans 走 sel_transition_ops —— 和 status 一样从 file_operations
++     * 的成员上取,见 hook_selinux_status_open()。找不到就只放弃这一个出口,
++     * 不影响前面已经装好的四个,也不让整个特性开不起来。 */
++    {
++        struct file_operations *ops = find_kernel_symbol_exact("sel_transition_ops");
++        if (!ops) {
++            pr_err("selinux_hide: sel_transition_ops not found, validatetrans will not be hidden\n");
++        } else {
++            validatetrans_write_fn vt = my_write_validatetrans;
++
++            validatetrans_write = &ops->write;
++            orig_validatetrans_write = *validatetrans_write;
++            ret = ksu_patch_text(validatetrans_write, &vt, sizeof(vt), KSU_PATCH_TEXT_FLUSH_DCACHE);
++            if (ret) {
++                pr_err("selinux_hide: init: patch_text validatetrans err: %d\n", ret);
++                validatetrans_write = NULL;
++                orig_validatetrans_write = NULL;
++            }
++        }
++    }
++#endif
++
+     ret = ksu_lsm_hook(&selinux_setprocattr_hook);
+     if (ret) {
+         pr_err("selinux_hide: init: selinux_setprocattr_hook err: %d\n", ret);
+@@ -389,6 +638,28 @@
+             pr_err("selinux_hide: exit: patch_text access_write err: %d\n", ret);
+         }
+     }
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
++    int i;
++
++    for (i = 0; i < ARRAY_SIZE(ksu_hide_txn_ino); i++) {
++        if (!ksu_hide_txn_slot[i] || !ksu_hide_txn_orig[i])
++            continue;
++        ret = ksu_patch_text(ksu_hide_txn_slot[i], &ksu_hide_txn_orig[i], sizeof(write_op_fn),
++                             KSU_PATCH_TEXT_FLUSH_DCACHE);
++        if (ret)
++            pr_err("selinux_hide: exit: patch_text ino=%d err: %d\n", ksu_hide_txn_ino[i], ret);
++        ksu_hide_txn_slot[i] = NULL;
++        ksu_hide_txn_orig[i] = NULL;
++    }
++    if (validatetrans_write && orig_validatetrans_write) {
++        ret = ksu_patch_text(validatetrans_write, &orig_validatetrans_write, sizeof(orig_validatetrans_write),
++                             KSU_PATCH_TEXT_FLUSH_DCACHE);
++        if (ret)
++            pr_err("selinux_hide: exit: patch_text validatetrans err: %d\n", ret);
++        validatetrans_write = NULL;
++        orig_validatetrans_write = NULL;
++    }
++#endif
+     if (sel_open_handle_status_slot && orig_sel_open_handle_status) {
+         ret = ksu_patch_text(sel_open_handle_status_slot, &orig_sel_open_handle_status,
+                              sizeof(orig_sel_open_handle_status), KSU_PATCH_TEXT_FLUSH_DCACHE);
+@@ -486,6 +757,12 @@
  
  void __init ksu_selinux_hide_init()
  {
@@ -1559,7 +1801,7 @@
      if (ksu_register_feature_handler(&selinux_hide_handler)) {
          pr_err("Failed to register selinux_hide feature handler\n");
      }
-@@ -506,22 +566,35 @@
+@@ -506,22 +783,35 @@
      }
      mutex_unlock(&selinux_hide_mutex);
      ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
@@ -1603,7 +1845,7 @@
      }
      mutex_unlock(&selinux_hide_mutex);
  }
-@@ -605,7 +678,7 @@
+@@ -605,7 +895,7 @@
      return rc;
  }
  
@@ -1612,7 +1854,7 @@
                                                 u32 *sid, u32 def_sid, gfp_t gfp_flags)
  {
      struct policydb *policydb;
-@@ -712,7 +785,7 @@
+@@ -712,7 +1002,7 @@
      return rc;
  }
  
@@ -1621,7 +1863,7 @@
                                                 u32 *scontext_len)
  {
      struct policydb *policydb;
-@@ -744,7 +817,7 @@
+@@ -744,7 +1034,7 @@
      return rc;
  }
  
@@ -1630,7 +1872,7 @@
  {
      avd->allowed = 0;
      avd->auditallow = 0;
-@@ -1085,7 +1158,7 @@
+@@ -1085,7 +1375,7 @@
      type_attribute_bounds_av(policydb, scontext, tcontext, tclass, avd);
  }
  
@@ -3789,11 +4031,11 @@
  #include "infra/seccomp_cache.h"
 +
 +/* 4.19 的 struct seccomp_filter 里没有 action_cache,这份内存布局
-+ * 镜像是照 5.7+ 抄的,set_bit 会写到 kmalloc-32 对象的第 28..35 字节 ——
++ * 镜像是照 5.10.2+ 抄的,set_bit 会写到 kmalloc-32 对象的第 28..35 字节 ——
 + * 越界踩相邻 slab 对象。4.19 的 seccomp 本来就是纯 BPF 求值、没有快路径,
 + * 所以这里留同签名的空实现。细节见
 + * gen_ksu_patch.py:build_seccomp_cache_419。 */
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 2)
  
  struct action_cache {
      DECLARE_BITMAP(allow_native, SECCOMP_ARCH_NATIVE_NR);
@@ -3812,3 +4054,187 @@
 +    /* 同上:没有缓存可点,BPF 求值照旧走。 */
 +}
 +#endif
+--- a/kernel/feature/uts_spoof.c
++++ b/kernel/feature/uts_spoof.c
+@@ -5,30 +5,45 @@
+ #include "infra/symbol_resolver.h"
+ #include "klog.h"
+ 
+-static void do_spoof_version(struct rw_semaphore *sem, struct uts_namespace *ns,
+-                             const char *release, const char *version)
++/*
++ * strscpy 在 4.19 上是强制 NUL 截断的(见本文件 build_uts_spoof_419 的说明),
++ * 超长伪装串会留下一个半截版本号,还一行日志都不打。超额就整项放弃,让版本号
++ * 保持原厂 —— 三个 uname 来源互相一致,比"看起来改过"重要。
++ */
++static int spoof_field(char *dst, size_t size, const char *src, const char *what)
+ {
++    ssize_t ret;
++
++    if (!src || src[0] == '\0')
++        return 0;
++
++    ret = strscpy(dst, src, size);
++    if (ret < 0) {
++        pr_err("ksu: spoof %s does not fit (%zu > %zu), keeping the original\n", what, strlen(src), size - 1);
++        dst[0] = '\0';
++        return (int)ret;
++    }
++    return 0;
++}
++
++static int do_spoof_version(struct rw_semaphore *sem, struct uts_namespace *ns, const char *release,
++                            const char *version)
++{
++    struct new_utsname *name;
++    int ret = 0;
++
+     if (sem) {
+         down_write(sem);
+     } else {
+         down_write(&uts_sem);
+     }
+ 
+-    if (ns) {
+-        if (release && release[0] != '\0') {
+-            strscpy(ns->name.release, release, sizeof(ns->name.release));
+-        }
+-        if (version && version[0] != '\0') {
+-            strscpy(ns->name.version, version, sizeof(ns->name.version));
+-        }
+-    } else {
+-        if (release && release[0] != '\0') {
+-            strscpy(init_uts_ns.name.release, release, sizeof(init_uts_ns.name.release));
+-        }
+-        if (version && version[0] != '\0') {
+-            strscpy(init_uts_ns.name.version, version, sizeof(init_uts_ns.name.version));
+-        }
+-    }
++    /* init_uts_ns.name 和 ns->name 都是 struct new_utsname,合成一个指针省得
++     * 下面每一步都写 if (ns) ... else ...。 */
++    name = ns ? &ns->name : &init_uts_ns.name;
++
++    ret |= spoof_field(name->release, sizeof(name->release), release, "release");
++    ret |= spoof_field(name->version, sizeof(name->version), version, "version");
+ 
+     if (sem) {
+         up_write(sem);
+@@ -36,11 +51,9 @@
+         up_write(&uts_sem);
+     }
+ 
+-    if (ns) {
+-        pr_info("ksu: spoofed version: %s, release: %s\n", ns->name.version, ns->name.release);
+-    } else {
+-        pr_info("ksu: spoofed version: %s, release: %s\n", init_uts_ns.name.version, init_uts_ns.name.release);
+-    }
++    pr_info("ksu: spoofed version: %s, release: %s\n", name->version, name->release);
++
++    return ret;
+ }
+ 
+ void ksu_spoof_version(const char *spoof_release, const char *spoof_version)
+@@ -56,7 +69,5 @@
+     struct rw_semaphore *sem = (struct rw_semaphore *)find_kernel_symbol_exact("uts_sem");
+     struct uts_namespace *ns = (struct uts_namespace *)find_kernel_symbol_exact("init_uts_ns");
+ 
+-    do_spoof_version(sem, ns, release, version);
+-
+-    return 0;
++    return do_spoof_version(sem, ns, release, version);
+ }
+--- a/kernel/hook/arm64/syscall_hook.c
++++ b/kernel/hook/arm64/syscall_hook.c
+@@ -48,24 +48,34 @@
+ 
+ // Direct syscall table patching: overwrite syscall_table[nr] with fn,
+ // save original to *old, and record for restoration at module exit.
+-void ksu_syscall_table_hook(int nr, syscall_fn_t fn, syscall_fn_t *old)
+-{
+-    if (ksu_syscall_table == NULL)
+-        return;
++int ksu_syscall_table_hook(int nr, syscall_fn_t fn, syscall_fn_t *old)
++{
++    int ret;
++    bool found = false;
++    syscall_fn_t orig;
++    int i;
++
++    if (ksu_syscall_table == NULL) {
++        pr_err("hook syscall %d failed: syscall table not resolved\n", nr);
++        return -ENOENT;
++    }
+     if (nr < 0 || nr >= __NR_syscalls) {
+-        pr_info("invalid nr: %d\n", nr);
+-        return;
+-    }
+-
+-    mutex_lock(&hooked_entries_lock);
+-
+-    syscall_fn_t orig = READ_ONCE(ksu_syscall_table[nr]);
++        pr_err("hook syscall %d failed: nr out of range\n", nr);
++        return -EINVAL;
++    }
++
++    orig = READ_ONCE(ksu_syscall_table[nr]);
+     if (old)
+         *old = orig;
+ 
+-    // Record for later restoration
+-    int i;
+-    bool found = false;
++    // Patch first, record second. The other way round, a failed patch still
++    // left a "tracked" entry behind, and exit would then write the original
++    // value back to a slot it had never changed.
++    ret = patch_syscall_table(nr, fn);
++    if (ret)
++        return ret;
++
++    mutex_lock(&hooked_entries_lock);
+     for (i = 0; i < hooked_count; i++) {
+         if (hooked_entries[i].nr == nr) {
+             found = true;
+@@ -81,10 +91,9 @@
+             pr_warn("hooked_entries full, cannot track syscall %d for restoration\n", nr);
+         }
+     }
+-
+-    patch_syscall_table(nr, fn);
+-
+     mutex_unlock(&hooked_entries_lock);
++
++    return 0;
+ }
+ 
+ // Restore syscall_table[nr] to its original value and remove from tracking list.
+--- a/kernel/hook/syscall_hook.h
++++ b/kernel/hook/syscall_hook.h
+@@ -37,7 +37,10 @@
+ // Saves the original handler to *@old (if non-NULL) and records the entry
+ // for restoration at module exit. Use this for boot-time hooks that replace
+ // a real syscall entry (e.g. ksud hooking __NR_execve/__NR_read/__NR_fstat).
+-void ksu_syscall_table_hook(int nr, syscall_fn_t fn, syscall_fn_t *old);
++// Returns 0 on success; -ENOENT if the syscall table could not be resolved,
++// -EINVAL if nr is out of range, -EIO if the patch itself failed. Never
++// fails silently — a caller that ignores this has no way to notice.
++int ksu_syscall_table_hook(int nr, syscall_fn_t fn, syscall_fn_t *old);
+ 
+ // Restore syscall_table[@nr] to its original value recorded by
+ // ksu_syscall_table_hook(), and remove the entry from the tracking list.
+--- a/kernel/runtime/ksud_integration.c
++++ b/kernel/runtime/ksud_integration.c
+@@ -637,8 +637,12 @@
+ {
+     int ret;
+ 
+-    ksu_syscall_table_hook(__NR_read, ksu_sys_read, &orig_sys_read);
+-    ksu_syscall_table_hook(__NR_fstat, ksu_sys_fstat, &orig_sys_fstat);
++    ret = ksu_syscall_table_hook(__NR_read, ksu_sys_read, &orig_sys_read);
++    if (ret)
++        pr_err("ksud: hook __NR_read failed: %d, init.rc injection will not work\n", ret);
++    ret = ksu_syscall_table_hook(__NR_fstat, ksu_sys_fstat, &orig_sys_fstat);
++    if (ret)
++        pr_err("ksud: hook __NR_fstat failed: %d, init.rc injection will not work\n", ret);
+ 
+     ret = register_kprobe(&input_event_kp);
+     pr_info("ksud: input_event_kp: %d\n", ret);
